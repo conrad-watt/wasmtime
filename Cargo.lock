@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "cranelift"
-version = "0.81.0"
+version = "0.82.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -522,14 +522,14 @@ dependencies = [
 
 [[package]]
 name = "cranelift-bforest"
-version = "0.81.0"
+version = "0.82.0"
 dependencies = [
  "cranelift-entity",
 ]
 
 [[package]]
 name = "cranelift-codegen"
-version = "0.81.0"
+version = "0.82.0"
 dependencies = [
  "bincode",
  "cranelift-bforest",
@@ -551,18 +551,18 @@ dependencies = [
 
 [[package]]
 name = "cranelift-codegen-meta"
-version = "0.81.0"
+version = "0.82.0"
 dependencies = [
  "cranelift-codegen-shared",
 ]
 
 [[package]]
 name = "cranelift-codegen-shared"
-version = "0.81.0"
+version = "0.82.0"
 
 [[package]]
 name = "cranelift-entity"
-version = "0.81.0"
+version = "0.82.0"
 dependencies = [
  "serde",
 ]
@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "cranelift-frontend"
-version = "0.81.0"
+version = "0.82.0"
 dependencies = [
  "cranelift-codegen",
  "hashbrown",
@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "cranelift-interpreter"
-version = "0.81.0"
+version = "0.82.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-entity",
@@ -623,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "cranelift-isle"
-version = "0.81.0"
+version = "0.82.0"
 dependencies = [
  "log",
  "miette",
@@ -632,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "cranelift-jit"
-version = "0.81.0"
+version = "0.82.0"
 dependencies = [
  "anyhow",
  "cranelift",
@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "cranelift-module"
-version = "0.81.0"
+version = "0.82.0"
 dependencies = [
  "anyhow",
  "cranelift-codegen",
@@ -660,7 +660,7 @@ dependencies = [
 
 [[package]]
 name = "cranelift-native"
-version = "0.81.0"
+version = "0.82.0"
 dependencies = [
  "cranelift-codegen",
  "libc",
@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "cranelift-object"
-version = "0.81.0"
+version = "0.82.0"
 dependencies = [
  "anyhow",
  "cranelift-codegen",
@@ -683,14 +683,14 @@ dependencies = [
 
 [[package]]
 name = "cranelift-preopt"
-version = "0.81.0"
+version = "0.82.0"
 dependencies = [
  "cranelift-codegen",
 ]
 
 [[package]]
 name = "cranelift-reader"
-version = "0.81.0"
+version = "0.82.0"
 dependencies = [
  "cranelift-codegen",
  "smallvec",
@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "cranelift-serde"
-version = "0.81.0"
+version = "0.82.0"
 dependencies = [
  "clap",
  "cranelift-codegen",
@@ -743,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "cranelift-wasm"
-version = "0.81.0"
+version = "0.82.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-entity",
@@ -3181,7 +3181,7 @@ checksum = "fd6fbd9a79829dd1ad0cc20627bf1ed606756a7f77edff7b66b7064f9cb327c6"
 
 [[package]]
 name = "wasi-cap-std-sync"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3204,7 +3204,7 @@ dependencies = [
 
 [[package]]
 name = "wasi-common"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "bitflags",
@@ -3248,7 +3248,7 @@ dependencies = [
 
 [[package]]
 name = "wasi-tokio"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "cap-std",
@@ -3392,7 +3392,7 @@ dependencies = [
 
 [[package]]
 name = "wasmtime"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3465,7 +3465,7 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-cache"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -3488,7 +3488,7 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-cli"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3530,7 +3530,7 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-cranelift"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "cranelift-codegen",
@@ -3550,7 +3550,7 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-environ"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "cranelift-entity",
@@ -3568,7 +3568,7 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-fiber"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "backtrace",
  "cc",
@@ -3617,7 +3617,7 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-jit"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "addr2line",
  "anyhow",
@@ -3642,7 +3642,7 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-jit-debug"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "lazy_static",
  "object",
@@ -3651,7 +3651,7 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-runtime"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "backtrace",
@@ -3677,7 +3677,7 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-types"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "cranelift-entity",
  "serde",
@@ -3687,7 +3687,7 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-wasi"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "wasi-cap-std-sync",
@@ -3699,7 +3699,7 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-wasi-crypto"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "wasi-crypto",
@@ -3709,7 +3709,7 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-wasi-nn"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "openvino",
@@ -3720,7 +3720,7 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-wast"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "wasmtime",
@@ -3779,7 +3779,7 @@ dependencies = [
 
 [[package]]
 name = "wiggle"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3796,7 +3796,7 @@ dependencies = [
 
 [[package]]
 name = "wiggle-generate"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "heck",
@@ -3809,7 +3809,7 @@ dependencies = [
 
 [[package]]
 name = "wiggle-macro"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "proc-macro2",
  "quote",
