@@ -620,7 +620,7 @@ impl ScalarSize {
     /// Convert to an integer operand size.
     pub fn operand_size(&self) -> OperandSize {
         match self {
-            ScalarSize::Size32 => OperandSize::Size32,
+            ScalarSize::Size8 | ScalarSize::Size16 | ScalarSize::Size32 => OperandSize::Size32,
             ScalarSize::Size64 => OperandSize::Size64,
             _ => panic!("Unexpected operand_size request for: {:?}", self),
         }
@@ -641,6 +641,16 @@ impl ScalarSize {
             ScalarSize::Size32 => 0b00,
             ScalarSize::Size64 => 0b01,
             _ => panic!("Unexpected scalar FP operand size: {:?}", self),
+        }
+    }
+
+    pub fn widen(&self) -> ScalarSize {
+        match self {
+            ScalarSize::Size8 => ScalarSize::Size16,
+            ScalarSize::Size16 => ScalarSize::Size32,
+            ScalarSize::Size32 => ScalarSize::Size64,
+            ScalarSize::Size64 => ScalarSize::Size128,
+            ScalarSize::Size128 => panic!("can't widen 128-bits"),
         }
     }
 }
@@ -677,8 +687,11 @@ impl VectorSize {
         debug_assert!(ty.is_vector());
 
         match ty {
+            B8X8 => VectorSize::Size8x8,
             B8X16 => VectorSize::Size8x16,
+            B16X4 => VectorSize::Size16x4,
             B16X8 => VectorSize::Size16x8,
+            B32X2 => VectorSize::Size32x2,
             B32X4 => VectorSize::Size32x4,
             B64X2 => VectorSize::Size64x2,
             F32X2 => VectorSize::Size32x2,
@@ -706,12 +719,9 @@ impl VectorSize {
     /// Get the scalar operand size that corresponds to a lane of a vector with a certain size.
     pub fn lane_size(&self) -> ScalarSize {
         match self {
-            VectorSize::Size8x8 => ScalarSize::Size8,
-            VectorSize::Size8x16 => ScalarSize::Size8,
-            VectorSize::Size16x4 => ScalarSize::Size16,
-            VectorSize::Size16x8 => ScalarSize::Size16,
-            VectorSize::Size32x2 => ScalarSize::Size32,
-            VectorSize::Size32x4 => ScalarSize::Size32,
+            VectorSize::Size8x8 | VectorSize::Size8x16 => ScalarSize::Size8,
+            VectorSize::Size16x4 | VectorSize::Size16x8 => ScalarSize::Size16,
+            VectorSize::Size32x2 | VectorSize::Size32x4 => ScalarSize::Size32,
             VectorSize::Size64x2 => ScalarSize::Size64,
         }
     }
@@ -741,5 +751,30 @@ impl VectorSize {
         };
 
         (q, size)
+    }
+
+    /// Return the encoding bit that is used by some floating-point SIMD
+    /// instructions for a particular operand size.
+    pub fn enc_float_size(&self) -> u32 {
+        match self.lane_size() {
+            ScalarSize::Size32 => 0b0,
+            ScalarSize::Size64 => 0b1,
+            size => panic!("Unsupported floating-point size for vector op: {:?}", size),
+        }
+    }
+}
+
+pub(crate) fn dynamic_to_fixed(ty: Type) -> Type {
+    match ty {
+        I8X8XN => I8X8,
+        I8X16XN => I8X16,
+        I16X4XN => I16X4,
+        I16X8XN => I16X8,
+        I32X2XN => I32X2,
+        I32X4XN => I32X4,
+        I64X2XN => I64X2,
+        F32X4XN => F32X4,
+        F64X2XN => F64X2,
+        _ => unreachable!("unhandled type: {}", ty),
     }
 }

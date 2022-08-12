@@ -119,7 +119,7 @@ fn gen_to_and_from_str(name: &str, values: &[&'static str], fmt: &mut Formatter)
     });
     fmtln!(fmt, "}");
 
-    fmtln!(fmt, "impl str::FromStr for {} {{", name);
+    fmtln!(fmt, "impl core::str::FromStr for {} {{", name);
     fmt.indent(|fmt| {
         fmtln!(fmt, "type Err = ();");
         fmtln!(fmt, "fn from_str(s: &str) -> Result<Self, Self::Err> {");
@@ -370,7 +370,11 @@ fn gen_descriptors(group: &SettingGroup, fmt: &mut Formatter) {
     );
     fmt.indent(|fmt| {
         for preset in &group.presets {
-            fmt.comment(preset.name);
+            fmt.comment(format!(
+                "{}: {}",
+                preset.name,
+                preset.setting_names(&group).collect::<Vec<_>>().join(", ")
+            ));
             for (mask, value) in preset.layout(&group) {
                 fmtln!(fmt, "(0b{:08b}, 0b{:08b}),", mask, value);
             }

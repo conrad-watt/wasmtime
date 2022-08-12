@@ -33,8 +33,11 @@ pub const ENC_R15: u8 = 15;
 // Constructors for Regs.
 
 fn gpr(enc: u8) -> Reg {
-    let preg = PReg::new(enc as usize, RegClass::Int);
+    let preg = gpr_preg(enc);
     Reg::from(VReg::new(preg.index(), RegClass::Int))
+}
+pub(crate) const fn gpr_preg(enc: u8) -> PReg {
+    PReg::new(enc as usize, RegClass::Int)
 }
 
 pub(crate) fn rsi() -> Reg {
@@ -96,8 +99,12 @@ pub(crate) fn pinned_reg() -> Reg {
 }
 
 fn fpr(enc: u8) -> Reg {
-    let preg = PReg::new(enc as usize, RegClass::Float);
+    let preg = fpr_preg(enc);
     Reg::from(VReg::new(preg.index(), RegClass::Float))
+}
+
+pub(crate) const fn fpr_preg(enc: u8) -> PReg {
+    PReg::new(enc as usize, RegClass::Float)
 }
 
 pub(crate) fn xmm0() -> Reg {
@@ -166,7 +173,7 @@ pub(crate) fn create_reg_env_systemv(flags: &settings::Flags) -> MachineEnv {
                 preg(rdx()),
                 preg(r8()),
                 preg(r9()),
-                // N.B.: not r10; it is our scratch reg.
+                preg(r10()),
                 preg(r11()),
             ],
             // Preferred XMMs: all of them.
@@ -186,7 +193,7 @@ pub(crate) fn create_reg_env_systemv(flags: &settings::Flags) -> MachineEnv {
                 preg(xmm12()),
                 preg(xmm13()),
                 preg(xmm14()),
-                // N.B.: not xmm15; it is our scratch reg.
+                preg(xmm15()),
             ],
         ],
         non_preferred_regs_by_class: [
@@ -195,7 +202,6 @@ pub(crate) fn create_reg_env_systemv(flags: &settings::Flags) -> MachineEnv {
             // Non-preferred XMMs: none.
             vec![],
         ],
-        scratch_by_class: [preg(r10()), preg(xmm15())],
         fixed_stack_slots: vec![],
     };
 

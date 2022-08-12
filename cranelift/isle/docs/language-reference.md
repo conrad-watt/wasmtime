@@ -359,7 +359,7 @@ For a simple example, consider the following rules:
 ```
 
 This set of rules will rewrite `(A (B (D 42)))` to `(C (D 42))`, then
-to `(E 42)` (via the first and third rules respectively).
+to `(E 42)` (via the first and second rules respectively).
 
 How is this useful? First, rewriting one term to another (here, `C` at
 the top level) that in turn appears in the left-hand side of other
@@ -466,7 +466,7 @@ can represent various concepts in a compiler backend: values, but also
 machine instructions or parts of those instructions ("integer
 immediate value encodable in machine's particular format"), or
 abstract bundles of information with invariants or guarantees encoded
-in the type system ("load that I can sink", "instruciton that produces
+in the type system ("load that I can sink", "instruction that produces
 flags").
 
 ISLE's other key departure from many other systems is its first-class
@@ -729,10 +729,10 @@ a `T2`. Concretely:
     
     (decl Translate (T1) T2)
     
-    (rule (Translate (T1.A ...)
-                     (T2.X ...)))
-    (rule (Translate (T1.B ...)
-                     (T2.Y ...)))
+    (rule (Translate (T1.A ...))
+          (T2.X ...))
+    (rule (Translate (T1.B ...))
+          (T2.Y ...))
 ```
 
 This gets to the heart of rewrite-system-based computation, and has
@@ -764,8 +764,8 @@ one could have:
     (decl TranslateToMachine1 (IR) Machine1)
     (decl TranslateToMachine2 (IR) Machine2)
     
-    (rule (TranslateToMachine1 (IR.add a b) (Machine1.add a b)))
-    (rule (TranslateToMachine2 (IR.add a b) (Machine2.weird_inst a b)))
+    (rule (TranslateToMachine1 (IR.add a b)) (Machine1.add a b))
+    (rule (TranslateToMachine2 (IR.add a b)) (Machine2.weird_inst a b))
 ```
 
 and then both translations are available. We are "rewriting" from `IR`
@@ -908,7 +908,7 @@ This also works in the extractor position: for example, if one writes
     (decl iadd (Value Value) Inst)
     
     (rule (lower (iadd (iadd a b) c))
-          ...))
+          ...)
           
     (convert Inst Value defining_instruction)
 ```

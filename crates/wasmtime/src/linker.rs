@@ -2,8 +2,8 @@ use crate::func::HostFunc;
 use crate::instance::InstancePre;
 use crate::store::StoreOpaque;
 use crate::{
-    AsContextMut, Caller, Engine, Extern, Func, FuncType, ImportType, Instance, IntoFunc, Module,
-    StoreContextMut, Trap, Val, ValRaw,
+    AsContextMut, Caller, Engine, Extern, ExternType, Func, FuncType, ImportType, Instance,
+    IntoFunc, Module, StoreContextMut, Trap, Val, ValRaw,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use log::warn;
@@ -237,6 +237,48 @@ impl<T> Linker<T> {
         self
     }
 
+    /// Implement any imports of the given [`Module`] with a function which traps.
+    ///
+    /// By default a [`Linker`] will error when unknown imports are encountered
+    /// in a command module while using [`Linker::module`]. Use this function
+    /// when
+    ///
+    /// This method can be used to allow unknown imports from command modules.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use wasmtime::*;
+    /// # fn main() -> anyhow::Result<()> {
+    /// # let engine = Engine::default();
+    /// # let module = Module::new(&engine, "(module (import \"unknown\" \"import\" (func)))")?;
+    /// # let mut store = Store::new(&engine, ());
+    /// let mut linker = Linker::new(&engine);
+    /// linker.define_unknown_imports_as_traps(&module)?;
+    /// linker.instantiate(&mut store, &module)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(compiler)]
+    #[cfg_attr(nightlydoc, doc(cfg(feature = "cranelift")))] // see build.rs
+    pub fn define_unknown_imports_as_traps(&mut self, module: &Module) -> anyhow::Result<()> {
+        for import in module.imports() {
+            if self._get_by_import(&import).is_err() {
+                if let ExternType::Func(func_ty) = import.ty() {
+                    let err_msg = format!(
+                        "unknown import: `{}::{}` has not been defined",
+                        import.module(),
+                        import.name(),
+                    );
+                    self.func_new(import.module(), import.name(), func_ty, move |_, _, _| {
+                        Err(Trap::new(err_msg.clone()))
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Defines a new item in this [`Linker`].
     ///
     /// This method will add a new definition, by name, to this instance of
@@ -324,7 +366,7 @@ impl<T> Linker<T> {
         module: &str,
         name: &str,
         ty: FuncType,
-        func: impl Fn(Caller<'_, T>, *mut ValRaw) -> Result<(), Trap> + Send + Sync + 'static,
+        func: impl Fn(Caller<'_, T>, &mut [ValRaw]) -> Result<(), Trap> + Send + Sync + 'static,
     ) -> Result<&mut Self> {
         let func = HostFunc::new_unchecked(&self.engine, ty, func);
         let key = self.import_key(module, Some(name));

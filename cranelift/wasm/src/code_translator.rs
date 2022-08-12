@@ -72,7 +72,7 @@
 //!     ("Relax verification to allow I8X16 to act as a default vector type")
 
 use super::{hash_map, HashMap};
-use crate::environ::{FuncEnvironment, GlobalVariable, ReturnMode};
+use crate::environ::{FuncEnvironment, GlobalVariable};
 use crate::state::{ControlStackFrame, ElseData, FuncTranslationState};
 use crate::translation_utils::{
     block_with_params, blocktype_params_results, f32_translation, f64_translation,
@@ -89,6 +89,7 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::packed_option::ReservedValue;
 use cranelift_frontend::{FunctionBuilder, Variable};
+use itertools::Itertools;
 use smallvec::SmallVec;
 use std::cmp;
 use std::convert::TryFrom;
@@ -160,7 +161,9 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
                 GlobalVariable::Const(val) => val,
                 GlobalVariable::Memory { gv, offset, ty } => {
                     let addr = builder.ins().global_value(environ.pointer_type(), gv);
-                    let flags = ir::MemFlags::trusted();
+                    let mut flags = ir::MemFlags::trusted();
+                    // Put globals in the "table" abstract heap category as well.
+                    flags.set_table();
                     builder.ins().load(ty, flags, addr, offset)
                 }
                 GlobalVariable::Custom => environ.translate_custom_global_get(
@@ -175,7 +178,9 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
                 GlobalVariable::Const(_) => panic!("global #{} is a constant", *global_index),
                 GlobalVariable::Memory { gv, offset, ty } => {
                     let addr = builder.ins().global_value(environ.pointer_type(), gv);
-                    let flags = ir::MemFlags::trusted();
+                    let mut flags = ir::MemFlags::trusted();
+                    // Put globals in the "table" abstract heap category as well.
+                    flags.set_table();
                     let mut val = state.pop1();
                     // Ensure SIMD values are cast to their default Cranelift type, I8x16.
                     if ty.is_vector() {
@@ -526,26 +531,14 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             state.reachable = false;
         }
         Operator::Return => {
-            let (return_count, br_destination) = {
+            let return_count = {
                 let frame = &mut state.control_stack[0];
-                if environ.return_mode() == ReturnMode::FallthroughReturn {
-                    frame.set_branched_to_exit();
-                }
-                let return_count = frame.num_return_values();
-                (return_count, frame.br_destination())
+                frame.num_return_values()
             };
             {
                 let return_args = state.peekn_mut(return_count);
-                let return_types = wasm_param_types(&builder.func.signature.returns, |i| {
-                    environ.is_wasm_return(&builder.func.signature, i)
-                });
-                bitcast_arguments(return_args, &return_types, builder);
-                match environ.return_mode() {
-                    ReturnMode::NormalReturns => builder.ins().return_(return_args),
-                    ReturnMode::FallthroughReturn => {
-                        canonicalise_then_jump(builder, br_destination, return_args)
-                    }
-                };
+                bitcast_wasm_returns(environ, return_args, builder);
+                builder.ins().return_(return_args);
             }
             state.popn(return_count);
             state.reachable = false;
@@ -571,13 +564,13 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             let (fref, num_args) = state.get_direct_func(builder.func, *function_index, environ)?;
 
             // Bitcast any vector arguments to their default type, I8X16, before calling.
-            let callee_signature =
-                &builder.func.dfg.signatures[builder.func.dfg.ext_funcs[fref].signature];
             let args = state.peekn_mut(num_args);
-            let types = wasm_param_types(&callee_signature.params, |i| {
-                environ.is_wasm_parameter(&callee_signature, i)
-            });
-            bitcast_arguments(args, &types, builder);
+            bitcast_wasm_params(
+                environ,
+                builder.func.dfg.ext_funcs[fref].signature,
+                args,
+                builder,
+            );
 
             let call = environ.translate_call(
                 builder.cursor(),
@@ -608,12 +601,8 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             let callee = state.pop1();
 
             // Bitcast any vector arguments to their default type, I8X16, before calling.
-            let callee_signature = &builder.func.dfg.signatures[sigref];
             let args = state.peekn_mut(num_args);
-            let types = wasm_param_types(&callee_signature.params, |i| {
-                environ.is_wasm_parameter(&callee_signature, i)
-            });
-            bitcast_arguments(args, &types, builder);
+            bitcast_wasm_params(environ, sigref, args, builder);
 
             let call = environ.translate_call_indirect(
                 builder,
@@ -1626,29 +1615,23 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
         Operator::I8x16Shl | Operator::I16x8Shl | Operator::I32x4Shl | Operator::I64x2Shl => {
             let (a, b) = state.pop2();
             let bitcast_a = optionally_bitcast_vector(a, type_of(op), builder);
-            let bitwidth = i64::from(type_of(op).lane_bits());
-            // The spec expects to shift with `b mod lanewidth`; so, e.g., for 16 bit lane-width
-            // we do `b AND 15`; this means fewer instructions than `iconst + urem`.
-            let b_mod_bitwidth = builder.ins().band_imm(b, bitwidth - 1);
-            state.push1(builder.ins().ishl(bitcast_a, b_mod_bitwidth))
+            // The spec expects to shift with `b mod lanewidth`; This is directly compatible
+            // with cranelift's instruction.
+            state.push1(builder.ins().ishl(bitcast_a, b))
         }
         Operator::I8x16ShrU | Operator::I16x8ShrU | Operator::I32x4ShrU | Operator::I64x2ShrU => {
             let (a, b) = state.pop2();
             let bitcast_a = optionally_bitcast_vector(a, type_of(op), builder);
-            let bitwidth = i64::from(type_of(op).lane_bits());
-            // The spec expects to shift with `b mod lanewidth`; so, e.g., for 16 bit lane-width
-            // we do `b AND 15`; this means fewer instructions than `iconst + urem`.
-            let b_mod_bitwidth = builder.ins().band_imm(b, bitwidth - 1);
-            state.push1(builder.ins().ushr(bitcast_a, b_mod_bitwidth))
+            // The spec expects to shift with `b mod lanewidth`; This is directly compatible
+            // with cranelift's instruction.
+            state.push1(builder.ins().ushr(bitcast_a, b))
         }
         Operator::I8x16ShrS | Operator::I16x8ShrS | Operator::I32x4ShrS | Operator::I64x2ShrS => {
             let (a, b) = state.pop2();
             let bitcast_a = optionally_bitcast_vector(a, type_of(op), builder);
-            let bitwidth = i64::from(type_of(op).lane_bits());
-            // The spec expects to shift with `b mod lanewidth`; so, e.g., for 16 bit lane-width
-            // we do `b AND 15`; this means fewer instructions than `iconst + urem`.
-            let b_mod_bitwidth = builder.ins().band_imm(b, bitwidth - 1);
-            state.push1(builder.ins().sshr(bitcast_a, b_mod_bitwidth))
+            // The spec expects to shift with `b mod lanewidth`; This is directly compatible
+            // with cranelift's instruction.
+            state.push1(builder.ins().sshr(bitcast_a, b))
         }
         Operator::V128Bitselect => {
             let (a, b, c) = state.pop3();
@@ -2349,6 +2332,12 @@ fn prepare_addr<FE: FuncEnvironment + ?Sized>(
     let mut flags = MemFlags::new();
     flags.set_endianness(ir::Endianness::Little);
 
+    // The access occurs to the `heap` disjoint category of abstract
+    // state. This may allow alias analysis to merge redundant loads,
+    // etc. when heap accesses occur interleaved with other (table,
+    // vmctx, stack) accesses.
+    flags.set_heap();
+
     Ok((flags, addr, offset.into()))
 }
 
@@ -3014,40 +3003,75 @@ fn pop2_with_bitcast(
     (bitcast_a, bitcast_b)
 }
 
-/// A helper for bitcasting a sequence of values (e.g. function arguments). If a value is a
-/// vector type that does not match its expected type, this will modify the value in place to point
-/// to the result of a `raw_bitcast`. This conversion is necessary to translate Wasm code that
-/// uses `V128` as function parameters (or implicitly in block parameters) and still use specific
-/// CLIF types (e.g. `I32X4`) in the function body.
-pub fn bitcast_arguments(
+fn bitcast_arguments<'a>(
+    builder: &FunctionBuilder,
+    arguments: &'a mut [Value],
+    params: &[ir::AbiParam],
+    param_predicate: impl Fn(usize) -> bool,
+) -> Vec<(Type, &'a mut Value)> {
+    let filtered_param_types = params
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| param_predicate(*i))
+        .map(|(_, param)| param.value_type);
+
+    // zip_eq, from the itertools::Itertools trait, is like Iterator::zip but panics if one
+    // iterator ends before the other. The `param_predicate` is required to select exactly as many
+    // elements of `params` as there are elements in `arguments`.
+    let pairs = filtered_param_types.zip_eq(arguments.iter_mut());
+
+    // The arguments which need to be bitcasted are those which have some vector type but the type
+    // expected by the parameter is not the same vector type as that of the provided argument.
+    pairs
+        .filter(|(param_type, _)| param_type.is_vector())
+        .filter(|(param_type, arg)| {
+            let arg_type = builder.func.dfg.value_type(**arg);
+            assert!(
+                arg_type.is_vector(),
+                "unexpected type mismatch: expected {}, argument {} was actually of type {}",
+                param_type,
+                *arg,
+                arg_type
+            );
+
+            // This is the same check that would be done by `optionally_bitcast_vector`, except we
+            // can't take a mutable borrow of the FunctionBuilder here, so we defer inserting the
+            // bitcast instruction to the caller.
+            arg_type != *param_type
+        })
+        .collect()
+}
+
+/// A helper for bitcasting a sequence of return values for the function currently being built. If
+/// a value is a vector type that does not match its expected type, this will modify the value in
+/// place to point to the result of a `raw_bitcast`. This conversion is necessary to translate Wasm
+/// code that uses `V128` as function parameters (or implicitly in block parameters) and still use
+/// specific CLIF types (e.g. `I32X4`) in the function body.
+pub fn bitcast_wasm_returns<FE: FuncEnvironment + ?Sized>(
+    environ: &mut FE,
     arguments: &mut [Value],
-    expected_types: &[Type],
     builder: &mut FunctionBuilder,
 ) {
-    assert_eq!(arguments.len(), expected_types.len());
-    for (i, t) in expected_types.iter().enumerate() {
-        if t.is_vector() {
-            assert!(
-                builder.func.dfg.value_type(arguments[i]).is_vector(),
-                "unexpected type mismatch: expected {}, argument {} was actually of type {}",
-                t,
-                arguments[i],
-                builder.func.dfg.value_type(arguments[i])
-            );
-            arguments[i] = optionally_bitcast_vector(arguments[i], *t, builder)
-        }
+    let changes = bitcast_arguments(builder, arguments, &builder.func.signature.returns, |i| {
+        environ.is_wasm_return(&builder.func.signature, i)
+    });
+    for (t, arg) in changes {
+        *arg = builder.ins().raw_bitcast(t, *arg);
     }
 }
 
-/// A helper to extract all the `Type` listings of each variable in `params`
-/// for only parameters the return true for `is_wasm`, typically paired with
-/// `is_wasm_return` or `is_wasm_parameter`.
-pub fn wasm_param_types(params: &[ir::AbiParam], is_wasm: impl Fn(usize) -> bool) -> Vec<Type> {
-    let mut ret = Vec::with_capacity(params.len());
-    for (i, param) in params.iter().enumerate() {
-        if is_wasm(i) {
-            ret.push(param.value_type);
-        }
+/// Like `bitcast_wasm_returns`, but for the parameters being passed to a specified callee.
+fn bitcast_wasm_params<FE: FuncEnvironment + ?Sized>(
+    environ: &mut FE,
+    callee_signature: ir::SigRef,
+    arguments: &mut [Value],
+    builder: &mut FunctionBuilder,
+) {
+    let callee_signature = &builder.func.dfg.signatures[callee_signature];
+    let changes = bitcast_arguments(builder, arguments, &callee_signature.params, |i| {
+        environ.is_wasm_parameter(&callee_signature, i)
+    });
+    for (t, arg) in changes {
+        *arg = builder.ins().raw_bitcast(t, *arg);
     }
-    ret
 }

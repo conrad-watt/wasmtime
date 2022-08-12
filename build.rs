@@ -28,6 +28,7 @@ fn main() -> anyhow::Result<()> {
             test_directory_module(out, "tests/misc_testsuite/simd", strategy)?;
             test_directory_module(out, "tests/misc_testsuite/threads", strategy)?;
             test_directory_module(out, "tests/misc_testsuite/memory64", strategy)?;
+            test_directory_module(out, "tests/misc_testsuite/component-model", strategy)?;
             Ok(())
         })?;
 
@@ -36,12 +37,11 @@ fn main() -> anyhow::Result<()> {
             // Skip running spec_testsuite tests if the submodule isn't checked
             // out.
             if spec_tests > 0 {
-                test_directory_module(out, "tests/spec_testsuite/proposals/simd", strategy)?;
                 test_directory_module(out, "tests/spec_testsuite/proposals/memory64", strategy)?;
             } else {
                 println!(
                     "cargo:warning=The spec testsuite is disabled. To enable, run `git submodule \
-                 update --remote`."
+                     update --remote`."
                 );
             }
             Ok(())
@@ -169,9 +169,9 @@ fn write_testsuite_tests(
 fn ignore(testsuite: &str, testname: &str, strategy: &str) -> bool {
     match strategy {
         "Cranelift" => match (testsuite, testname) {
-            // No simd support yet for s390x.
-            ("simd", _) if platform_is_s390x() => return true,
-            ("memory64", "simd") if platform_is_s390x() => return true,
+            // FIXME: These tests fail under qemu due to a qemu bug.
+            (_, "simd_f32x4_pmin_pmax") if platform_is_s390x() => return true,
+            (_, "simd_f64x2_pmin_pmax") if platform_is_s390x() => return true,
             _ => {}
         },
         _ => panic!("unrecognized strategy"),

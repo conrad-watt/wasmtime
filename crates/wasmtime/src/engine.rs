@@ -1,5 +1,5 @@
 use crate::signatures::SignatureRegistry;
-use crate::{Config, Trap};
+use crate::Config;
 use anyhow::Result;
 use once_cell::sync::OnceCell;
 #[cfg(feature = "parallel-compilation")]
@@ -9,6 +9,7 @@ use std::sync::Arc;
 #[cfg(feature = "cache")]
 use wasmtime_cache::CacheConfig;
 use wasmtime_environ::FlagValue;
+use wasmtime_jit::ProfilingAgent;
 use wasmtime_runtime::{debug_builtins, CompiledModuleIdAllocator, InstanceAllocator};
 
 /// An `Engine` which is a global context for compilation and management of wasm
@@ -43,6 +44,7 @@ struct EngineInner {
     #[cfg(compiler)]
     compiler: Box<dyn wasmtime_environ::Compiler>,
     allocator: Box<dyn InstanceAllocator>,
+    profiler: Box<dyn ProfilingAgent>,
     signatures: SignatureRegistry,
     epoch: AtomicU64,
     unique_id_allocator: CompiledModuleIdAllocator,
@@ -55,24 +57,41 @@ struct EngineInner {
 impl Engine {
     /// Creates a new [`Engine`] with the specified compilation and
     /// configuration settings.
+    ///
+    /// # Errors
+    ///
+    /// This method can fail if the `config` is invalid or some
+    /// configurations are incompatible.
+    ///
+    /// For example, feature `reference_types` will need to set
+    /// the compiler setting `enable_safepoints` and `unwind_info`
+    /// to `true`, but explicitly disable these two compiler settings
+    /// will cause errors.
     pub fn new(config: &Config) -> Result<Engine> {
         // Ensure that wasmtime_runtime's signal handlers are configured. This
         // is the per-program initialization required for handling traps, such
         // as configuring signals, vectored exception handlers, etc.
-        wasmtime_runtime::init_traps(crate::module::GlobalModuleRegistry::is_wasm_trap_pc);
+        wasmtime_runtime::init_traps(crate::module::is_wasm_trap_pc);
         debug_builtins::ensure_exported();
 
         let registry = SignatureRegistry::new();
         let mut config = config.clone();
+        config.validate()?;
+
+        #[cfg(compiler)]
+        let compiler = config.build_compiler()?;
+
         let allocator = config.build_allocator()?;
         allocator.adjust_tunables(&mut config.tunables);
+        let profiler = config.build_profiler()?;
 
         Ok(Engine {
             inner: Arc::new(EngineInner {
                 #[cfg(compiler)]
-                compiler: config.compiler.build()?,
+                compiler,
                 config,
                 allocator,
+                profiler,
                 signatures: registry,
                 epoch: AtomicU64::new(0),
                 unique_id_allocator: CompiledModuleIdAllocator::new(),
@@ -98,8 +117,8 @@ impl Engine {
     /// on calls into WebAssembly. This is provided for use cases where the
     /// latency of WebAssembly calls are extra-important, which is not
     /// necessarily true of all embeddings.
-    pub fn tls_eager_initialize() -> Result<(), Trap> {
-        wasmtime_runtime::tls_eager_initialize().map_err(Trap::from_runtime_box)
+    pub fn tls_eager_initialize() {
+        wasmtime_runtime::tls_eager_initialize();
     }
 
     /// Returns the configuration settings that this engine is using.
@@ -115,6 +134,10 @@ impl Engine {
 
     pub(crate) fn allocator(&self) -> &dyn InstanceAllocator {
         self.inner.allocator.as_ref()
+    }
+
+    pub(crate) fn profiler(&self) -> &dyn ProfilingAgent {
+        self.inner.profiler.as_ref()
     }
 
     #[cfg(feature = "cache")]
@@ -224,6 +247,25 @@ impl Engine {
             .collect::<Result<Vec<B>, E>>()
     }
 
+    /// Executes `f1` and `f2` in parallel if parallel compilation is enabled at
+    /// both runtime and compile time, otherwise runs them synchronously.
+    #[allow(dead_code)] // only used for the component-model feature right now
+    pub(crate) fn join_maybe_parallel<T, U>(
+        &self,
+        f1: impl FnOnce() -> T + Send,
+        f2: impl FnOnce() -> U + Send,
+    ) -> (T, U)
+    where
+        T: Send,
+        U: Send,
+    {
+        if self.config().parallel_compilation {
+            #[cfg(feature = "parallel-compilation")]
+            return rayon::join(f1, f2);
+        }
+        (f1(), f2())
+    }
+
     /// Returns the target triple which this engine is compiling code for
     /// and/or running code for.
     pub(crate) fn target(&self) -> target_lexicon::Triple {
@@ -303,15 +345,13 @@ impl Engine {
             // can affect the way the generated code performs or behaves at
             // runtime.
             "avoid_div_traps" => *value == FlagValue::Bool(true),
-            "unwind_info" => *value == FlagValue::Bool(cfg!(feature = "wasm-backtrace")),
             "libcall_call_conv" => *value == FlagValue::Enum("isa_default".into()),
+            "preserve_frame_pointers" => *value == FlagValue::Bool(true),
 
             // Features wasmtime doesn't use should all be disabled, since
             // otherwise if they are enabled it could change the behavior of
             // generated code.
-            "baldrdash_prologue_words" => *value == FlagValue::Num(0),
             "enable_llvm_abi_extensions" => *value == FlagValue::Bool(false),
-            "emit_all_ones_funcaddrs" => *value == FlagValue::Bool(false),
             "enable_pinned_reg" => *value == FlagValue::Bool(false),
             "enable_probestack" => *value == FlagValue::Bool(false),
             "use_colocated_libcalls" => *value == FlagValue::Bool(false),
@@ -321,6 +361,15 @@ impl Engine {
             // this setting can have any value.
             "enable_safepoints" => {
                 if self.config().features.reference_types {
+                    *value == FlagValue::Bool(true)
+                } else {
+                    return Ok(())
+                }
+            }
+
+            // Windows requires unwind info as part of its ABI.
+            "unwind_info" => {
+                if self.target().operating_system == target_lexicon::OperatingSystem::Windows {
                     *value == FlagValue::Bool(true)
                 } else {
                     return Ok(())
@@ -338,13 +387,16 @@ impl Engine {
             | "enable_simd"
             | "enable_verifier"
             | "regalloc_checker"
+            | "regalloc_verbose_logs"
             | "is_pic"
             | "machine_code_cfg_info"
             | "tls_model" // wasmtime doesn't use tls right now
             | "opt_level" // opt level doesn't change semantics
+            | "enable_alias_analysis" // alias analysis-based opts don't change semantics
             | "probestack_func_adjusts_sp" // probestack above asserted disabled
             | "probestack_size_log2" // probestack above asserted disabled
             | "regalloc" // shouldn't change semantics
+            | "enable_incremental_compilation_cache_checks" // shouldn't change semantics
             | "enable_atomics" => return Ok(()),
 
             // Everything else is unknown and needs to be added somewhere to
@@ -397,6 +449,18 @@ impl Engine {
         {
             enabled = match flag {
                 "has_lse" => Some(std::arch::is_aarch64_feature_detected!("lse")),
+                // No effect on its own, but in order to simplify the code on a
+                // platform without pointer authentication support we fail if
+                // "has_pauth" is enabled, but "sign_return_address" is not.
+                "has_pauth" => Some(std::arch::is_aarch64_feature_detected!("paca")),
+                // No effect on its own.
+                "sign_return_address_all" => Some(true),
+                // The pointer authentication instructions act as a `NOP` when
+                // unsupported (but keep in mind "has_pauth" as well), so it is
+                // safe to enable them.
+                "sign_return_address" => Some(true),
+                // No effect on its own.
+                "sign_return_address_with_bkey" => Some(true),
                 // fall through to the very bottom to indicate that support is
                 // not enabled to test whether this feature is enabled on the
                 // host.
@@ -432,6 +496,7 @@ impl Engine {
                 "has_popcnt" => Some(std::is_x86_feature_detected!("popcnt")),
                 "has_avx" => Some(std::is_x86_feature_detected!("avx")),
                 "has_avx2" => Some(std::is_x86_feature_detected!("avx2")),
+                "has_fma" => Some(std::is_x86_feature_detected!("fma")),
                 "has_bmi1" => Some(std::is_x86_feature_detected!("bmi1")),
                 "has_bmi2" => Some(std::is_x86_feature_detected!("bmi2")),
                 "has_avx512bitalg" => Some(std::is_x86_feature_detected!("avx512bitalg")),
@@ -476,6 +541,7 @@ impl Default for Engine {
 #[cfg(test)]
 mod tests {
     use crate::{Config, Engine, Module, OptLevel};
+
     use anyhow::Result;
     use tempfile::TempDir;
 
@@ -527,18 +593,15 @@ mod tests {
         assert_eq!(engine.config().cache_config.cache_hits(), 1);
         assert_eq!(engine.config().cache_config.cache_misses(), 1);
 
-        // FIXME(#1523) need debuginfo on aarch64 before we run this test there
-        if !cfg!(target_arch = "aarch64") {
-            let mut cfg = Config::new();
-            cfg.debug_info(true).cache_config_load(&config_path)?;
-            let engine = Engine::new(&cfg)?;
-            Module::new(&engine, "(module (func))")?;
-            assert_eq!(engine.config().cache_config.cache_hits(), 0);
-            assert_eq!(engine.config().cache_config.cache_misses(), 1);
-            Module::new(&engine, "(module (func))")?;
-            assert_eq!(engine.config().cache_config.cache_hits(), 1);
-            assert_eq!(engine.config().cache_config.cache_misses(), 1);
-        }
+        let mut cfg = Config::new();
+        cfg.debug_info(true).cache_config_load(&config_path)?;
+        let engine = Engine::new(&cfg)?;
+        Module::new(&engine, "(module (func))")?;
+        assert_eq!(engine.config().cache_config.cache_hits(), 0);
+        assert_eq!(engine.config().cache_config.cache_misses(), 1);
+        Module::new(&engine, "(module (func))")?;
+        assert_eq!(engine.config().cache_config.cache_hits(), 1);
+        assert_eq!(engine.config().cache_config.cache_misses(), 1);
 
         Ok(())
     }

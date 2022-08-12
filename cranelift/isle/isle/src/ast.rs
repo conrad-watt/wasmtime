@@ -3,6 +3,7 @@
 #![allow(missing_docs)]
 
 use crate::lexer::Pos;
+use crate::log;
 use std::sync::Arc;
 
 /// The parsed form of an ISLE file.
@@ -120,7 +121,7 @@ pub enum Pattern {
         pos: Pos,
     },
     /// An operator that matches a constant integer value.
-    ConstInt { val: i64, pos: Pos },
+    ConstInt { val: i128, pos: Pos },
     /// An operator that matches an external constant value.
     ConstPrim { val: Ident, pos: Pos },
     /// An application of a type variant or term.
@@ -172,7 +173,7 @@ impl Pattern {
     }
 
     pub fn make_macro_template(&self, macro_args: &[Ident]) -> Pattern {
-        log::trace!("make_macro_template: {:?} with {:?}", self, macro_args);
+        log!("make_macro_template: {:?} with {:?}", self, macro_args);
         match self {
             &Pattern::BindPattern {
                 ref var,
@@ -233,7 +234,7 @@ impl Pattern {
     }
 
     pub fn subst_macro_args(&self, macro_args: &[Pattern]) -> Option<Pattern> {
-        log::trace!("subst_macro_args: {:?} with {:?}", self, macro_args);
+        log!("subst_macro_args: {:?} with {:?}", self, macro_args);
         match self {
             &Pattern::BindPattern {
                 ref var,
@@ -305,7 +306,7 @@ pub enum Expr {
     /// A variable use.
     Var { name: Ident, pos: Pos },
     /// A constant integer.
-    ConstInt { val: i64, pos: Pos },
+    ConstInt { val: i128, pos: Pos },
     /// A constant of some other primitive type.
     ConstPrim { val: Ident, pos: Pos },
     /// The `(let ((var ty val)*) body)` form.

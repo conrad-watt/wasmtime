@@ -9,18 +9,19 @@ use crate::sourcemap::SourceMap;
 use crate::testcommand::TestCommand;
 use crate::testfile::{Comment, Details, Feature, TestFile};
 use cranelift_codegen::data_value::DataValue;
-use cranelift_codegen::entity::EntityRef;
-use cranelift_codegen::ir;
-use cranelift_codegen::ir::entities::AnyEntity;
+use cranelift_codegen::entity::{EntityRef, PrimaryMap};
+use cranelift_codegen::ir::entities::{AnyEntity, DynamicType};
 use cranelift_codegen::ir::immediates::{Ieee32, Ieee64, Imm64, Offset32, Uimm32, Uimm64};
 use cranelift_codegen::ir::instructions::{InstructionData, InstructionFormat, VariableArgs};
 use cranelift_codegen::ir::types::INVALID;
 use cranelift_codegen::ir::types::*;
+use cranelift_codegen::ir::{self, UserExternalNameRef};
 use cranelift_codegen::ir::{
-    AbiParam, ArgumentExtension, ArgumentPurpose, Block, Constant, ConstantData, ExtFuncData,
-    ExternalName, FuncRef, Function, GlobalValue, GlobalValueData, Heap, HeapData, HeapStyle,
-    JumpTable, JumpTableData, MemFlags, Opcode, SigRef, Signature, StackSlot, StackSlotData,
-    StackSlotKind, Table, TableData, Type, Value,
+    AbiParam, ArgumentExtension, ArgumentPurpose, Block, Constant, ConstantData, DynamicStackSlot,
+    DynamicStackSlotData, DynamicTypeData, ExtFuncData, ExternalName, FuncRef, Function,
+    GlobalValue, GlobalValueData, Heap, HeapData, HeapStyle, JumpTable, JumpTableData, MemFlags,
+    Opcode, SigRef, Signature, StackSlot, StackSlotData, StackSlotKind, Table, TableData, Type,
+    UserFuncName, Value,
 };
 use cranelift_codegen::isa::{self, CallConv};
 use cranelift_codegen::packed_option::ReservedValue;
@@ -224,6 +225,12 @@ pub struct Parser<'a> {
     /// Comments collected so far.
     comments: Vec<Comment<'a>>,
 
+    /// Maps inlined external names to a ref value, so they can be declared before parsing the rest
+    /// of the function later.
+    ///
+    /// This maintains backward compatibility with previous ways for declaring external names.
+    predeclared_external_names: PrimaryMap<UserExternalNameRef, ir::UserExternalName>,
+
     /// Default calling conventions; used when none is specified.
     default_calling_convention: CallConv,
 }
@@ -249,11 +256,11 @@ impl Context {
     // Allocate a new stack slot.
     fn add_ss(&mut self, ss: StackSlot, data: StackSlotData, loc: Location) -> ParseResult<()> {
         self.map.def_ss(ss, loc)?;
-        while self.function.stack_slots.next_key().index() <= ss.index() {
+        while self.function.sized_stack_slots.next_key().index() <= ss.index() {
             self.function
-                .create_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 0));
+                .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 0));
         }
-        self.function.stack_slots[ss] = data;
+        self.function.sized_stack_slots[ss] = data;
         Ok(())
     }
 
@@ -264,6 +271,47 @@ impl Context {
         } else {
             Ok(())
         }
+    }
+
+    // Allocate a new stack slot.
+    fn add_dss(
+        &mut self,
+        ss: DynamicStackSlot,
+        data: DynamicStackSlotData,
+        loc: Location,
+    ) -> ParseResult<()> {
+        self.map.def_dss(ss, loc)?;
+        while self.function.dynamic_stack_slots.next_key().index() <= ss.index() {
+            self.function
+                .create_dynamic_stack_slot(DynamicStackSlotData::new(
+                    StackSlotKind::ExplicitDynamicSlot,
+                    data.dyn_ty,
+                ));
+        }
+        self.function.dynamic_stack_slots[ss] = data;
+        Ok(())
+    }
+
+    // Resolve a reference to a dynamic stack slot.
+    fn check_dss(&self, dss: DynamicStackSlot, loc: Location) -> ParseResult<()> {
+        if !self.map.contains_dss(dss) {
+            err!(loc, "undefined dynamic stack slot {}", dss)
+        } else {
+            Ok(())
+        }
+    }
+
+    // Allocate a new dynamic type.
+    fn add_dt(&mut self, dt: DynamicType, data: DynamicTypeData, loc: Location) -> ParseResult<()> {
+        self.map.def_dt(dt, loc)?;
+        while self.function.dfg.dynamic_types.next_key().index() <= dt.index() {
+            self.function.dfg.make_dynamic_ty(DynamicTypeData::new(
+                data.base_vector_ty,
+                data.dynamic_scale,
+            ));
+        }
+        self.function.dfg.dynamic_types[dt] = data;
+        Ok(())
     }
 
     // Allocate a global value slot.
@@ -466,6 +514,7 @@ impl<'a> Parser<'a> {
             gathered_comments: Vec::new(),
             comments: Vec::new(),
             default_calling_convention: CallConv::Fast,
+            predeclared_external_names: Default::default(),
         }
     }
 
@@ -595,6 +644,33 @@ impl<'a> Parser<'a> {
             }
         }
         err!(self.loc, err_msg)
+    }
+
+    // Match and consume a dynamic stack slot reference.
+    fn match_dss(&mut self, err_msg: &str) -> ParseResult<DynamicStackSlot> {
+        if let Some(Token::DynamicStackSlot(ss)) = self.token() {
+            self.consume();
+            if let Some(ss) = DynamicStackSlot::with_number(ss) {
+                return Ok(ss);
+            }
+        }
+        err!(self.loc, err_msg)
+    }
+
+    // Match and consume a dynamic type reference.
+    fn match_dt(&mut self, err_msg: &str) -> ParseResult<DynamicType> {
+        if let Some(Token::DynamicType(dt)) = self.token() {
+            self.consume();
+            if let Some(dt) = DynamicType::with_number(dt) {
+                return Ok(dt);
+            }
+        }
+        err!(self.loc, err_msg)
+    }
+
+    // Extract Type from DynamicType
+    fn concrete_from_dt(&mut self, dt: DynamicType, ctx: &mut Context) -> Option<Type> {
+        ctx.function.get_concrete_dynamic_ty(dt)
     }
 
     // Match and consume a global value reference.
@@ -986,7 +1062,7 @@ impl<'a> Parser<'a> {
             vec![value; lane_size as usize]
         }
 
-        if !ty.is_vector() {
+        if !ty.is_vector() && !ty.is_dynamic_vector() {
             err!(self.loc, "Expected a controlling vector type, not {}", ty)
         } else {
             let constant_data = match ty.lane_type() {
@@ -1213,7 +1289,7 @@ impl<'a> Parser<'a> {
         let location = self.loc;
 
         // function ::= "function" * name signature "{" preamble function-body "}"
-        let name = self.parse_external_name()?;
+        let name = self.parse_user_func_name()?;
 
         // function ::= "function" name * signature "{" preamble function-body "}"
         let sig = self.parse_signature()?;
@@ -1238,6 +1314,16 @@ impl<'a> Parser<'a> {
         self.token();
         self.claim_gathered_comments(AnyEntity::Function);
 
+        // Claim all the declared user-defined function names.
+        for (user_func_ref, user_external_name) in
+            std::mem::take(&mut self.predeclared_external_names)
+        {
+            let actual_ref = ctx
+                .function
+                .declare_imported_user_function(user_external_name);
+            assert_eq!(user_func_ref, actual_ref);
+        }
+
         let details = Details {
             location,
             comments: self.take_comments(),
@@ -1247,18 +1333,17 @@ impl<'a> Parser<'a> {
         Ok((ctx.function, details))
     }
 
-    // Parse an external name.
+    // Parse a user-defined function name
     //
     // For example, in a function decl, the parser would be in this state:
     //
     // function ::= "function" * name signature { ... }
     //
-    fn parse_external_name(&mut self) -> ParseResult<ExternalName> {
+    fn parse_user_func_name(&mut self) -> ParseResult<UserFuncName> {
         match self.token() {
             Some(Token::Name(s)) => {
                 self.consume();
-                s.parse()
-                    .map_err(|_| self.error("invalid test case or libcall name"))
+                Ok(UserFuncName::testcase(s))
             }
             Some(Token::UserRef(namespace)) => {
                 self.consume();
@@ -1267,19 +1352,84 @@ impl<'a> Parser<'a> {
                         self.consume();
                         match self.token() {
                             Some(Token::Integer(index_str)) => {
+                                self.consume();
                                 let index: u32 =
                                     u32::from_str_radix(index_str, 10).map_err(|_| {
                                         self.error("the integer given overflows the u32 type")
                                     })?;
-                                self.consume();
-                                Ok(ExternalName::user(namespace, index))
+                                Ok(UserFuncName::user(namespace, index))
                             }
                             _ => err!(self.loc, "expected integer"),
                         }
                     }
-                    _ => err!(self.loc, "expected colon"),
+                    _ => {
+                        err!(self.loc, "expected user function name in the form uX:Y")
+                    }
                 }
             }
+            _ => err!(self.loc, "expected external name"),
+        }
+    }
+
+    // Parse an external name.
+    //
+    // For example, in a function reference decl, the parser would be in this state:
+    //
+    // fn0 = * name signature
+    //
+    fn parse_external_name(&mut self) -> ParseResult<ExternalName> {
+        match self.token() {
+            Some(Token::Name(s)) => {
+                self.consume();
+                s.parse()
+                    .map_err(|_| self.error("invalid test case or libcall name"))
+            }
+
+            Some(Token::UserNameRef(name_ref)) => {
+                self.consume();
+                Ok(ExternalName::user(UserExternalNameRef::new(
+                    name_ref as usize,
+                )))
+            }
+
+            Some(Token::UserRef(namespace)) => {
+                self.consume();
+                if let Some(Token::Colon) = self.token() {
+                    self.consume();
+                    match self.token() {
+                        Some(Token::Integer(index_str)) => {
+                            let index: u32 = u32::from_str_radix(index_str, 10).map_err(|_| {
+                                self.error("the integer given overflows the u32 type")
+                            })?;
+                            self.consume();
+
+                            // Deduplicate the reference (O(n), but should be fine for tests),
+                            // to follow `FunctionParameters::declare_imported_user_function`,
+                            // otherwise this will cause ref mismatches when asserted below.
+                            let name_ref = self
+                                .predeclared_external_names
+                                .iter()
+                                .find_map(|(reff, name)| {
+                                    if name.index == index && name.namespace == namespace {
+                                        Some(reff)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or_else(|| {
+                                    self.predeclared_external_names
+                                        .push(ir::UserExternalName { namespace, index })
+                                });
+
+                            Ok(ExternalName::user(name_ref))
+                        }
+                        _ => err!(self.loc, "expected integer"),
+                    }
+                } else {
+                    err!(self.loc, "expected colon")
+                }
+            }
+
             _ => err!(self.loc, "expected external name"),
         }
     }
@@ -1337,10 +1487,10 @@ impl<'a> Parser<'a> {
 
     // Parse a single argument type with flags.
     fn parse_abi_param(&mut self) -> ParseResult<AbiParam> {
-        // abi-param ::= * type { flag } [ argumentloc ]
+        // abi-param ::= * type { flag }
         let mut arg = AbiParam::new(self.match_type("expected parameter type")?);
 
-        // abi-param ::= type * { flag } [ argumentloc ]
+        // abi-param ::= type * { flag }
         while let Some(Token::Identifier(s)) = self.token() {
             match s {
                 "uext" => arg.extension = ArgumentExtension::Uext,
@@ -1385,6 +1535,18 @@ impl<'a> Parser<'a> {
                     let loc = self.loc;
                     self.parse_stack_slot_decl()
                         .and_then(|(ss, dat)| ctx.add_ss(ss, dat, loc))
+                }
+                Some(Token::DynamicStackSlot(..)) => {
+                    self.start_gathering_comments();
+                    let loc = self.loc;
+                    self.parse_dynamic_stack_slot_decl()
+                        .and_then(|(dss, dat)| ctx.add_dss(dss, dat, loc))
+                }
+                Some(Token::DynamicType(..)) => {
+                    self.start_gathering_comments();
+                    let loc = self.loc;
+                    self.parse_dynamic_type_decl()
+                        .and_then(|(dt, dat)| ctx.add_dt(dt, dat, loc))
                 }
                 Some(Token::GlobalValue(..)) => {
                     self.start_gathering_comments();
@@ -1465,6 +1627,39 @@ impl<'a> Parser<'a> {
         Ok((ss, data))
     }
 
+    fn parse_dynamic_stack_slot_decl(
+        &mut self,
+    ) -> ParseResult<(DynamicStackSlot, DynamicStackSlotData)> {
+        let dss = self.match_dss("expected stack slot number: dss«n»")?;
+        self.match_token(Token::Equal, "expected '=' in stack slot declaration")?;
+        let kind = self.match_enum("expected stack slot kind")?;
+        let dt = self.match_dt("expected dynamic type")?;
+        let data = DynamicStackSlotData::new(kind, dt);
+        // Collect any trailing comments.
+        self.token();
+        self.claim_gathered_comments(dss);
+
+        // TBD: stack-slot-decl ::= StackSlot(ss) "=" stack-slot-kind Bytes * {"," stack-slot-flag}
+        Ok((dss, data))
+    }
+
+    fn parse_dynamic_type_decl(&mut self) -> ParseResult<(DynamicType, DynamicTypeData)> {
+        let dt = self.match_dt("expected dynamic type number: dt«n»")?;
+        self.match_token(Token::Equal, "expected '=' in stack slot declaration")?;
+        let vector_base_ty = self.match_type("expected base type")?;
+        assert!(vector_base_ty.is_vector(), "expected vector type");
+        self.match_token(
+            Token::Multiply,
+            "expected '*' followed by a dynamic scale value",
+        )?;
+        let dyn_scale = self.match_gv("expected dynamic scale global value")?;
+        let data = DynamicTypeData::new(vector_base_ty, dyn_scale);
+        // Collect any trailing comments.
+        self.token();
+        self.claim_gathered_comments(dt);
+        Ok((dt, data))
+    }
+
     // Parse a global value decl.
     //
     // global-val-decl ::= * GlobalValue(gv) "=" global-val-desc
@@ -1472,6 +1667,7 @@ impl<'a> Parser<'a> {
     //                   | "load" "." type "notrap" "aligned" GlobalValue(base) [offset]
     //                   | "iadd_imm" "(" GlobalValue(base) ")" imm64
     //                   | "symbol" ["colocated"] name + imm64
+    //                   | "dyn_scale_target_const" "." type
     //
     fn parse_global_value_decl(&mut self) -> ParseResult<(GlobalValue, GlobalValueData)> {
         let gv = self.match_gv("expected global value number: gv«n»")?;
@@ -1529,6 +1725,15 @@ impl<'a> Parser<'a> {
                     colocated,
                     tls,
                 }
+            }
+            "dyn_scale_target_const" => {
+                self.match_token(
+                    Token::Dot,
+                    "expected '.' followed by type in dynamic scale global value decl",
+                )?;
+                let vector_type = self.match_type("expected load type")?;
+                assert!(vector_type.is_vector(), "Expected vector type");
+                GlobalValueData::DynScaleTargetConst { vector_type }
             }
             other => return err!(self.loc, "Unknown global value kind '{}'", other),
         };
@@ -2095,7 +2300,12 @@ impl<'a> Parser<'a> {
         // Look for a controlling type variable annotation.
         // instruction ::=  [inst-results "="] Opcode(opc) * ["." Type] ...
         let explicit_ctrl_type = if self.optional(Token::Dot) {
-            Some(self.match_type("expected type after 'opcode.'")?)
+            if let Some(Token::Type(_t)) = self.token() {
+                Some(self.match_type("expected type after 'opcode.'")?)
+            } else {
+                let dt = self.match_dt("expected dynamic type")?;
+                self.concrete_from_dt(dt, ctx)
+            }
         } else {
             None
         };
@@ -2120,7 +2330,7 @@ impl<'a> Parser<'a> {
             .expect("duplicate inst references created");
 
         if !srcloc.is_default() {
-            ctx.function.srclocs[inst] = srcloc;
+            ctx.function.set_srcloc(inst, srcloc);
         }
 
         if results.len() != num_results {
@@ -2489,11 +2699,15 @@ impl<'a> Parser<'a> {
             I128 => DataValue::from(self.match_imm128("expected an i128")?),
             F32 => DataValue::from(self.match_ieee32("expected an f32")?),
             F64 => DataValue::from(self.match_ieee64("expected an f64")?),
-            _ if ty.is_vector() => {
+            _ if (ty.is_vector() || ty.is_dynamic_vector()) => {
                 let as_vec = self.match_uimm128(ty)?.into_vec();
                 if as_vec.len() == 16 {
                     let mut as_array = [0; 16];
-                    as_array.copy_from_slice(&as_vec[..16]);
+                    as_array.copy_from_slice(&as_vec[..]);
+                    DataValue::from(as_array)
+                } else if as_vec.len() == 8 {
+                    let mut as_array = [0; 8];
+                    as_array.copy_from_slice(&as_vec[..]);
                     DataValue::from(as_array)
                 } else {
                     return Err(self.error("only 128-bit vectors are currently supported"));
@@ -2824,6 +3038,25 @@ impl<'a> Parser<'a> {
                     offset,
                 }
             }
+            InstructionFormat::DynamicStackLoad => {
+                let dss = self.match_dss("expected dynamic stack slot number: dss«n»")?;
+                ctx.check_dss(dss, self.loc)?;
+                InstructionData::DynamicStackLoad {
+                    opcode,
+                    dynamic_stack_slot: dss,
+                }
+            }
+            InstructionFormat::DynamicStackStore => {
+                let arg = self.match_value("expected SSA value operand")?;
+                self.match_token(Token::Comma, "expected ',' between operands")?;
+                let dss = self.match_dss("expected dynamic stack slot number: dss«n»")?;
+                ctx.check_dss(dss, self.loc)?;
+                InstructionData::DynamicStackStore {
+                    opcode,
+                    arg,
+                    dynamic_stack_slot: dss,
+                }
+            }
             InstructionFormat::HeapAddr => {
                 let heap = self.match_heap("expected heap identifier")?;
                 ctx.check_heap(heap, self.loc)?;
@@ -3023,14 +3256,14 @@ mod tests {
         assert_eq!(sig.returns.len(), 0);
         assert_eq!(sig.call_conv, CallConv::SystemV);
 
-        let sig2 = Parser::new("(i8 uext, f32, f64, i32 sret) -> i32 sext, f64 baldrdash_system_v")
+        let sig2 = Parser::new("(i8 uext, f32, f64, i32 sret) -> i32 sext, f64 system_v")
             .parse_signature()
             .unwrap();
         assert_eq!(
             sig2.to_string(),
-            "(i8 uext, f32, f64, i32 sret) -> i32 sext, f64 baldrdash_system_v"
+            "(i8 uext, f32, f64, i32 sret) -> i32 sext, f64 system_v"
         );
-        assert_eq!(sig2.call_conv, CallConv::BaldrdashSystemV);
+        assert_eq!(sig2.call_conv, CallConv::SystemV);
 
         // Old-style signature without a calling convention.
         assert_eq!(
@@ -3080,17 +3313,23 @@ mod tests {
         .parse_function()
         .unwrap();
         assert_eq!(func.name.to_string(), "%foo");
-        let mut iter = func.stack_slots.keys();
+        let mut iter = func.sized_stack_slots.keys();
         let _ss0 = iter.next().unwrap();
         let ss1 = iter.next().unwrap();
         assert_eq!(ss1.to_string(), "ss1");
-        assert_eq!(func.stack_slots[ss1].kind, StackSlotKind::ExplicitSlot);
-        assert_eq!(func.stack_slots[ss1].size, 1);
+        assert_eq!(
+            func.sized_stack_slots[ss1].kind,
+            StackSlotKind::ExplicitSlot
+        );
+        assert_eq!(func.sized_stack_slots[ss1].size, 1);
         let _ss2 = iter.next().unwrap();
         let ss3 = iter.next().unwrap();
         assert_eq!(ss3.to_string(), "ss3");
-        assert_eq!(func.stack_slots[ss3].kind, StackSlotKind::ExplicitSlot);
-        assert_eq!(func.stack_slots[ss3].size, 13);
+        assert_eq!(
+            func.sized_stack_slots[ss3].kind,
+            StackSlotKind::ExplicitSlot
+        );
+        assert_eq!(func.sized_stack_slots[ss3].size, 13);
         assert_eq!(iter.next(), None);
 
         // Catch duplicate definitions.

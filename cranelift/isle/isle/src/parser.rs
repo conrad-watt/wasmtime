@@ -39,7 +39,7 @@ impl<'a> Parser<'a> {
                 self.lexer.filenames[pos.file].clone(),
                 self.lexer.file_texts[pos.file].clone(),
             ),
-            span: miette::SourceSpan::from((pos.offset, 1)),
+            span: Span::new_single(pos),
         }
     }
 
@@ -114,7 +114,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn int(&mut self) -> Result<i64> {
+    fn int(&mut self) -> Result<i128> {
         match self.take(|tok| tok.is_int())? {
             Token::Int(i) => Ok(i),
             _ => unreachable!(),
@@ -391,7 +391,7 @@ impl<'a> Parser<'a> {
                         iflets,
                         expr,
                         pos,
-                        prio,
+                        prio: prio.map(|prio| i64::try_from(prio).unwrap()),
                     });
                 }
             }

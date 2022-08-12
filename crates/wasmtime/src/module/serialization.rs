@@ -7,7 +7,7 @@
 //! There are two main pieces of data associated with a binary artifact:
 //!
 //! 1. The compiled module image, currently an ELF file.
-//! 2. Compilation metadata for the module, including the `TypeTables`
+//! 2. Compilation metadata for the module, including the `ModuleTypes`
 //!    information. This metadata is validated for compilation settings.
 //!
 //! Compiled modules are, at this time, represented as an ELF file. This ELF
@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::str::FromStr;
-use wasmtime_environ::{FlagValue, Tunables, TypeTables};
+use wasmtime_environ::{FlagValue, ModuleTypes, Tunables};
 use wasmtime_jit::{subslice_range, CompiledModuleInfo};
 use wasmtime_runtime::MmapVec;
 
@@ -166,7 +166,7 @@ struct Metadata<'a> {
     isa_flags: BTreeMap<String, FlagValue>,
     tunables: Tunables,
     features: WasmFeatures,
-    types: MyCow<'a, TypeTables>,
+    types: MyCow<'a, ModuleTypes>,
 }
 
 impl<'a> SerializedModule<'a> {
@@ -180,7 +180,7 @@ impl<'a> SerializedModule<'a> {
     }
 
     #[cfg(compiler)]
-    pub fn from_artifacts(engine: &Engine, artifacts: &'a MmapVec, types: &'a TypeTables) -> Self {
+    pub fn from_artifacts(engine: &Engine, artifacts: &'a MmapVec, types: &'a ModuleTypes) -> Self {
         Self::with_data(engine, MyCow::Borrowed(artifacts), MyCow::Borrowed(types))
     }
 
@@ -188,7 +188,7 @@ impl<'a> SerializedModule<'a> {
     fn with_data(
         engine: &Engine,
         artifacts: MyCow<'a, MmapVec>,
-        types: MyCow<'a, TypeTables>,
+        types: MyCow<'a, ModuleTypes>,
     ) -> Self {
         Self {
             artifacts,
@@ -211,7 +211,7 @@ impl<'a> SerializedModule<'a> {
     pub fn into_parts(
         mut self,
         engine: &Engine,
-    ) -> Result<(MmapVec, Option<CompiledModuleInfo>, TypeTables)> {
+    ) -> Result<(MmapVec, Option<CompiledModuleInfo>, ModuleTypes)> {
         // Verify that the compilation settings in the engine match the
         // compilation settings of the module that's being loaded.
         self.check_triple(engine)?;
@@ -264,15 +264,15 @@ impl<'a> SerializedModule<'a> {
         )
     }
 
-    pub fn from_mmap(mmap: MmapVec, version_strat: &ModuleVersionStrategy) -> Result<Self> {
+    pub fn from_mmap(mut mmap: MmapVec, version_strat: &ModuleVersionStrategy) -> Result<Self> {
         // First validate that this is at least somewhat an elf file within
         // `mmap` and additionally skip to the end of the elf file to find our
         // metadata.
-        let metadata = data_after_elf(&mmap)?;
+        let elf = take_first_elf(&mut mmap)?;
 
         // The metadata has a few guards up front which we process first, and
         // eventually this bottoms out in a `bincode::deserialize` call.
-        let metadata = metadata
+        let metadata = mmap
             .strip_prefix(HEADER)
             .ok_or_else(|| anyhow!("bytes are not a compatible serialized wasmtime module"))?;
         if metadata.is_empty() {
@@ -309,13 +309,13 @@ impl<'a> SerializedModule<'a> {
             .context("deserialize compilation artifacts")?;
 
         return Ok(SerializedModule {
-            artifacts: MyCow::Owned(mmap),
+            artifacts: MyCow::Owned(elf),
             metadata,
         });
 
         /// This function will return the trailing data behind the ELF file
         /// parsed from `data` which is where we find our metadata section.
-        fn data_after_elf(data: &[u8]) -> Result<&[u8]> {
+        fn take_first_elf(mmap: &mut MmapVec) -> Result<MmapVec> {
             use object::NativeEndian as NE;
             // There's not actually a great utility for figuring out where
             // the end of an ELF file is in the `object` crate. In lieu of that
@@ -323,6 +323,7 @@ impl<'a> SerializedModule<'a> {
             // is that the header comes first, that tells us where the section
             // headers are, and for our ELF files the end of the file is the
             // end of the section headers.
+            let data = &mmap[..];
             let mut bytes = Bytes(data);
             let header = bytes
                 .read::<object::elf::FileHeader64<NE>>()
@@ -334,7 +335,7 @@ impl<'a> SerializedModule<'a> {
                 .section_headers(NE, data)
                 .context("failed to read section headers")?;
             let range = subslice_range(object::bytes_of_slice(sections), data);
-            Ok(&data[range.end..])
+            Ok(mmap.drain(..range.end))
         }
     }
 
@@ -426,6 +427,9 @@ impl<'a> SerializedModule<'a> {
             // setting just fine (it's just a section in the compiled file and
             // whether it's present or not)
             generate_address_map: _,
+
+            // Just a debugging aid, doesn't affect functionality at all.
+            debug_adapter_modules: _,
         } = self.metadata.tunables;
 
         Self::check_int(
@@ -607,14 +611,13 @@ mod test {
 
         match serialized.into_module(&engine) {
             Ok(_) => unreachable!(),
-            Err(e) => assert_eq!(
-                format!("{:?}", e),
+            Err(e) => assert!(format!("{:?}", e).starts_with(
                 "\
 compilation settings of module incompatible with native host
 
 Caused by:
     setting \"avoid_div_traps\" is configured to Bool(false) which is not supported"
-            ),
+            )),
         }
 
         Ok(())
@@ -634,14 +637,13 @@ Caused by:
 
         match serialized.into_module(&engine) {
             Ok(_) => unreachable!(),
-            Err(e) => assert_eq!(
-                format!("{:?}", e),
+            Err(e) => assert!(format!("{:?}", e).starts_with(
                 "\
 compilation settings of module incompatible with native host
 
 Caused by:
     cannot test if target-specific flag \"not_a_flag\" is available at runtime",
-            ),
+            )),
         }
 
         Ok(())

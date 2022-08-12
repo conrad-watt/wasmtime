@@ -162,10 +162,12 @@ impl MemoryImage {
                 // extra-super-sure that it never changes, and because
                 // this costs very little, we use the kernel's "seal" API
                 // to make the memfd image permanently read-only.
-                memfd.add_seal(memfd::FileSeal::SealGrow)?;
-                memfd.add_seal(memfd::FileSeal::SealShrink)?;
-                memfd.add_seal(memfd::FileSeal::SealWrite)?;
-                memfd.add_seal(memfd::FileSeal::SealSeal)?;
+                memfd.add_seals(&[
+                    memfd::FileSeal::SealGrow,
+                    memfd::FileSeal::SealShrink,
+                    memfd::FileSeal::SealWrite,
+                    memfd::FileSeal::SealSeal,
+                ])?;
 
                 Ok(Some(MemoryImage {
                     fd: FdSource::Memfd(memfd),
@@ -210,7 +212,7 @@ impl ModuleMemoryImages {
             _ => return Ok(None),
         };
         let mut memories = PrimaryMap::with_capacity(map.len());
-        let page_size = region::page::size() as u32;
+        let page_size = crate::page_size() as u32;
         for (memory_index, init) in map {
             // mmap-based-initialization only works for defined memories with a
             // known starting point of all zeros, so bail out if the mmeory is
@@ -333,7 +335,7 @@ impl MemoryImageSlot {
         // mprotect the relevant region.
         self.set_protection(
             self.cur_size..size_bytes,
-            rustix::io::MprotectFlags::READ | rustix::io::MprotectFlags::WRITE,
+            rustix::mm::MprotectFlags::READ | rustix::mm::MprotectFlags::WRITE,
         )?;
         self.cur_size = size_bytes;
 
@@ -386,7 +388,7 @@ impl MemoryImageSlot {
                 .map_err(|e| InstantiationError::Resource(e.into()))?;
             self.set_protection(
                 0..initial_size_bytes,
-                rustix::io::MprotectFlags::READ | rustix::io::MprotectFlags::WRITE,
+                rustix::mm::MprotectFlags::READ | rustix::mm::MprotectFlags::WRITE,
             )
             .map_err(|e| InstantiationError::Resource(e.into()))?;
         } else if initial_size_bytes < self.initial_size {
@@ -409,7 +411,7 @@ impl MemoryImageSlot {
             // mprotect(NONE) the zone from the first to the second.
             self.set_protection(
                 initial_size_bytes..self.initial_size,
-                rustix::io::MprotectFlags::empty(),
+                rustix::mm::MprotectFlags::empty(),
             )
             .map_err(|e| InstantiationError::Resource(e.into()))?;
         } else if initial_size_bytes > self.initial_size {
@@ -420,7 +422,7 @@ impl MemoryImageSlot {
             // made visible as zeros.
             self.set_protection(
                 self.initial_size..initial_size_bytes,
-                rustix::io::MprotectFlags::READ | rustix::io::MprotectFlags::WRITE,
+                rustix::mm::MprotectFlags::READ | rustix::mm::MprotectFlags::WRITE,
             )
             .map_err(|e| InstantiationError::Resource(e.into()))?;
         } else {
@@ -444,11 +446,11 @@ impl MemoryImageSlot {
             );
             if image.len > 0 {
                 unsafe {
-                    let ptr = rustix::io::mmap(
+                    let ptr = rustix::mm::mmap(
                         (self.base + image.linear_memory_offset) as *mut c_void,
                         image.len,
-                        rustix::io::ProtFlags::READ | rustix::io::ProtFlags::WRITE,
-                        rustix::io::MapFlags::PRIVATE | rustix::io::MapFlags::FIXED,
+                        rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
+                        rustix::mm::MapFlags::PRIVATE | rustix::mm::MapFlags::FIXED,
                         image.fd.as_file(),
                         image.fd_offset,
                     )
@@ -477,10 +479,10 @@ impl MemoryImageSlot {
                 // semantics we want for reuse between instances, so it's all we
                 // need to do.
                 unsafe {
-                    rustix::io::madvise(
+                    rustix::mm::madvise(
                         self.base as *mut c_void,
                         self.cur_size,
-                        rustix::io::Advice::LinuxDontNeed,
+                        rustix::mm::Advice::LinuxDontNeed,
                     )?;
                 }
             } else {
@@ -499,20 +501,20 @@ impl MemoryImageSlot {
         // mprotect the initial heap region beyond the initial heap size back to PROT_NONE.
         self.set_protection(
             self.initial_size..self.cur_size,
-            rustix::io::MprotectFlags::empty(),
+            rustix::mm::MprotectFlags::empty(),
         )?;
         self.cur_size = self.initial_size;
         self.dirty = false;
         Ok(())
     }
 
-    fn set_protection(&self, range: Range<usize>, flags: rustix::io::MprotectFlags) -> Result<()> {
+    fn set_protection(&self, range: Range<usize>, flags: rustix::mm::MprotectFlags) -> Result<()> {
         assert!(range.start <= range.end);
         assert!(range.end <= self.static_size);
         let mprotect_start = self.base.checked_add(range.start).unwrap();
         if range.len() > 0 {
             unsafe {
-                rustix::io::mprotect(mprotect_start as *mut _, range.len(), flags)?;
+                rustix::mm::mprotect(mprotect_start as *mut _, range.len(), flags)?;
             }
         }
 
@@ -532,11 +534,11 @@ impl MemoryImageSlot {
     /// inaccessible. Used both during instantiate and during drop.
     fn reset_with_anon_memory(&self) -> Result<()> {
         unsafe {
-            let ptr = rustix::io::mmap_anonymous(
+            let ptr = rustix::mm::mmap_anonymous(
                 self.base as *mut c_void,
                 self.static_size,
-                rustix::io::ProtFlags::empty(),
-                rustix::io::MapFlags::PRIVATE | rustix::io::MapFlags::FIXED,
+                rustix::mm::ProtFlags::empty(),
+                rustix::mm::MapFlags::PRIVATE | rustix::mm::MapFlags::FIXED,
             )?;
             assert_eq!(ptr as usize, self.base);
         }
@@ -594,7 +596,7 @@ mod test {
 
     fn create_memfd_with_data(offset: usize, data: &[u8]) -> Result<MemoryImage> {
         // Offset must be page-aligned.
-        let page_size = region::page::size();
+        let page_size = crate::page_size();
         assert_eq!(offset & (page_size - 1), 0);
         let memfd = create_memfd()?;
         memfd.as_file().write_all(data)?;

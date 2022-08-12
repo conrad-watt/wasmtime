@@ -37,14 +37,9 @@ pub struct Options {
 
     /// Specify an input file to be used. Use '-' for stdin.
     files: Vec<PathBuf>,
-
-    /// Enable debug output on stderr/stdout
-    #[clap(short)]
-    debug: bool,
 }
 
 pub fn run(options: &Options) -> Result<()> {
-    crate::handle_debug_flag(options.debug);
     let parsed = parse_sets_and_triple(&options.settings, &options.target)?;
     for path in &options.files {
         let name = String::from(path.as_os_str().to_string_lossy());
@@ -73,19 +68,20 @@ fn handle_module(options: &Options, path: &Path, name: &str, fisa: FlagsOrIsa) -
             let mut mem = vec![];
 
             // Compile and encode the result to machine code.
-            context
+            let compiled_code = context
                 .compile_and_emit(isa, &mut mem)
-                .map_err(|err| anyhow::anyhow!("{}", pretty_error(&context.func, err)))?;
-            let result = context.mach_compile_result.as_ref().unwrap();
-            let code_info = result.code_info();
+                .map_err(|err| anyhow::anyhow!("{}", pretty_error(&err.func, err.inner)))?;
+            let code_info = compiled_code.code_info();
 
             if options.print {
                 println!("{}", context.func.display());
             }
 
             if options.disasm {
+                let result = context.compiled_code().unwrap();
                 print_all(
                     isa,
+                    &context.func.params,
                     &mem,
                     code_info.total_size,
                     options.print,

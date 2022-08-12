@@ -4,8 +4,8 @@
 //! function to Cranelift IR guided by a `FuncEnvironment` which provides information about the
 //! WebAssembly module and the runtime environment.
 
-use crate::code_translator::{bitcast_arguments, translate_operator, wasm_param_types};
-use crate::environ::{FuncEnvironment, ReturnMode};
+use crate::code_translator::{bitcast_wasm_returns, translate_operator};
+use crate::environ::FuncEnvironment;
 use crate::state::FuncTranslationState;
 use crate::translation_utils::get_vmctx_value_label;
 use crate::WasmResult;
@@ -171,7 +171,7 @@ fn parse_local_decls<FE: FuncEnvironment + ?Sized>(
         builder.set_srcloc(cur_srcloc(reader));
         let pos = reader.original_position();
         let count = reader.read_var_u32()?;
-        let ty = reader.read_type()?;
+        let ty = reader.read_val_type()?;
         validator.define_locals(pos, count, ty)?;
         declare_locals(builder, count, ty, &mut next_local, environ)?;
     }
@@ -187,12 +187,12 @@ fn parse_local_decls<FE: FuncEnvironment + ?Sized>(
 fn declare_locals<FE: FuncEnvironment + ?Sized>(
     builder: &mut FunctionBuilder,
     count: u32,
-    wasm_type: wasmparser::Type,
+    wasm_type: wasmparser::ValType,
     next_local: &mut usize,
     environ: &mut FE,
 ) -> WasmResult<()> {
     // All locals are initialized to 0.
-    use wasmparser::Type::*;
+    use wasmparser::ValType::*;
     let zeroval = match wasm_type {
         I32 => builder.ins().iconst(ir::types::I32, 0),
         I64 => builder.ins().iconst(ir::types::I64, 0),
@@ -253,16 +253,8 @@ fn parse_function_body<FE: FuncEnvironment + ?Sized>(
     // generate a return instruction that doesn't match the signature.
     if state.reachable {
         if !builder.is_unreachable() {
-            match environ.return_mode() {
-                ReturnMode::NormalReturns => {
-                    let return_types = wasm_param_types(&builder.func.signature.returns, |i| {
-                        environ.is_wasm_return(&builder.func.signature, i)
-                    });
-                    bitcast_arguments(&mut state.stack, &return_types, builder);
-                    builder.ins().return_(&state.stack)
-                }
-                ReturnMode::FallthroughReturn => builder.ins().fallthrough_return(&state.stack),
-            };
+            bitcast_wasm_returns(environ, &mut state.stack, builder);
+            builder.ins().return_(&state.stack);
         }
     }
 
@@ -282,7 +274,7 @@ fn cur_srcloc(reader: &BinaryReader) -> ir::SourceLoc {
 
 #[cfg(test)]
 mod tests {
-    use super::{FuncTranslator, ReturnMode};
+    use super::FuncTranslator;
     use crate::environ::DummyEnvironment;
     use cranelift_codegen::ir::types::I32;
     use cranelift_codegen::{ir, isa, settings, Context};
@@ -313,13 +305,12 @@ mod tests {
                 default_call_conv: isa::CallConv::Fast,
                 pointer_width: PointerWidth::U64,
             },
-            ReturnMode::NormalReturns,
             false,
         );
 
         let mut ctx = Context::new();
 
-        ctx.func.name = ir::ExternalName::testcase("small1");
+        ctx.func.name = ir::UserFuncName::testcase("small1");
         ctx.func.signature.params.push(ir::AbiParam::new(I32));
         ctx.func.signature.returns.push(ir::AbiParam::new(I32));
 
@@ -352,13 +343,12 @@ mod tests {
                 default_call_conv: isa::CallConv::Fast,
                 pointer_width: PointerWidth::U64,
             },
-            ReturnMode::NormalReturns,
             false,
         );
 
         let mut ctx = Context::new();
 
-        ctx.func.name = ir::ExternalName::testcase("small2");
+        ctx.func.name = ir::UserFuncName::testcase("small2");
         ctx.func.signature.params.push(ir::AbiParam::new(I32));
         ctx.func.signature.returns.push(ir::AbiParam::new(I32));
 
@@ -396,13 +386,12 @@ mod tests {
                 default_call_conv: isa::CallConv::Fast,
                 pointer_width: PointerWidth::U64,
             },
-            ReturnMode::NormalReturns,
             false,
         );
 
         let mut ctx = Context::new();
 
-        ctx.func.name = ir::ExternalName::testcase("infloop");
+        ctx.func.name = ir::UserFuncName::testcase("infloop");
         ctx.func.signature.returns.push(ir::AbiParam::new(I32));
 
         let (body, mut validator) = extract_func(&wasm);

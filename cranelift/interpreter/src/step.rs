@@ -7,11 +7,12 @@ use crate::value::{Value, ValueConversionKind, ValueError, ValueResult};
 use cranelift_codegen::data_value::DataValue;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
-    types, Block, FuncRef, Function, InstructionData, Opcode, TrapCode, Value as ValueRef,
+    types, Block, FuncRef, Function, InstructionData, Opcode, TrapCode, Type, Value as ValueRef,
 };
 use log::trace;
 use smallvec::{smallvec, SmallVec};
 use std::convert::{TryFrom, TryInto};
+use std::fmt::Debug;
 use std::ops::RangeFrom;
 use thiserror::Error;
 
@@ -135,11 +136,11 @@ where
         Err(e) => ControlFlow::Trap(CraneliftTrap::User(memerror_to_trap(e))),
     };
 
-    let calculate_addr = |imm: V, args: SmallVec<[V; 1]>| -> ValueResult<u64> {
-        let imm = imm.convert(ValueConversionKind::ZeroExtend(ctrl_ty))?;
+    let calculate_addr = |addr_ty: Type, imm: V, args: SmallVec<[V; 1]>| -> ValueResult<u64> {
+        let imm = imm.convert(ValueConversionKind::ZeroExtend(addr_ty))?;
         let args = args
             .into_iter()
-            .map(|v| v.convert(ValueConversionKind::ZeroExtend(ctrl_ty)))
+            .map(|v| v.convert(ValueConversionKind::ZeroExtend(addr_ty)))
             .collect::<ValueResult<SmallVec<[V; 1]>>>()?;
 
         Ok(sum(imm, args)? as u64)
@@ -151,6 +152,20 @@ where
                   left: V,
                   right: V|
      -> ValueResult<ControlFlow<V>> { Ok(assign(op(left, right)?)) };
+
+    // Same as `binary_unsigned`, but converts the values to their unsigned form before the
+    // operation and back to signed form afterwards. Since Cranelift types have no notion of
+    // signedness, this enables operations that depend on sign.
+    let binary_unsigned =
+        |op: fn(V, V) -> ValueResult<V>, left: V, right: V| -> ValueResult<ControlFlow<V>> {
+            Ok(assign(
+                op(
+                    left.convert(ValueConversionKind::ToUnsigned)?,
+                    right.convert(ValueConversionKind::ToUnsigned)?,
+                )
+                .and_then(|v| v.convert(ValueConversionKind::ToSigned))?,
+            ))
+        };
 
     // Similar to `binary` but converts select `ValueError`'s into trap `ControlFlow`'s
     let binary_can_trap = |op: fn(V, V) -> ValueResult<V>,
@@ -271,7 +286,6 @@ where
             CraneliftTrap::User(trap_code()),
         ),
         Opcode::Return => ControlFlow::Return(args()?),
-        Opcode::FallthroughReturn => ControlFlow::Return(args()?),
         Opcode::Call => {
             if let InstructionData::Call { func_ref, .. } = inst {
                 let function = state
@@ -315,7 +329,7 @@ where
                 _ => unreachable!(),
             };
 
-            let addr_value = calculate_addr(imm(), args()?)?;
+            let addr_value = calculate_addr(types::I64, imm(), args()?)?;
             let loaded = assign_or_memtrap(
                 Address::try_from(addr_value).and_then(|addr| state.checked_load(addr, load_ty)),
             );
@@ -338,7 +352,7 @@ where
                 _ => unreachable!(),
             };
 
-            let addr_value = calculate_addr(imm(), args_range(1..)?)?;
+            let addr_value = calculate_addr(types::I64, imm(), args_range(1..)?)?;
             let reduced = if let Some(c) = kind {
                 arg(0)?.convert(c)?
             } else {
@@ -380,13 +394,61 @@ where
                 })
             })
         }
-        Opcode::GlobalValue => unimplemented!("GlobalValue"),
+        Opcode::DynamicStackAddr => unimplemented!("DynamicStackSlot"),
+        Opcode::DynamicStackLoad => unimplemented!("DynamicStackLoad"),
+        Opcode::DynamicStackStore => unimplemented!("DynamicStackStore"),
+        Opcode::GlobalValue => {
+            if let InstructionData::UnaryGlobalValue { global_value, .. } = inst {
+                assign_or_memtrap(state.resolve_global_value(global_value))
+            } else {
+                unreachable!()
+            }
+        }
         Opcode::SymbolValue => unimplemented!("SymbolValue"),
         Opcode::TlsValue => unimplemented!("TlsValue"),
-        Opcode::HeapAddr => unimplemented!("HeapAddr"),
-        Opcode::GetPinnedReg => unimplemented!("GetPinnedReg"),
-        Opcode::SetPinnedReg => unimplemented!("SetPinnedReg"),
-        Opcode::TableAddr => unimplemented!("TableAddr"),
+        Opcode::HeapAddr => {
+            if let InstructionData::HeapAddr { heap, .. } = inst {
+                let load_ty = inst_context.controlling_type().unwrap();
+                let offset = calculate_addr(ctrl_ty, imm(), args()?)? as u64;
+                assign_or_memtrap({
+                    AddressSize::try_from(load_ty).and_then(|addr_size| {
+                        let addr = state.heap_address(addr_size, heap, offset)?;
+                        let dv = DataValue::try_from(addr)?;
+                        Ok(dv.into())
+                    })
+                })
+            } else {
+                unreachable!()
+            }
+        }
+        Opcode::GetPinnedReg => assign(state.get_pinned_reg()),
+        Opcode::SetPinnedReg => {
+            let arg0 = arg(0)?;
+            state.set_pinned_reg(arg0);
+            ControlFlow::Continue
+        }
+        Opcode::TableAddr => {
+            if let InstructionData::TableAddr { table, offset, .. } = inst {
+                let table = &state.get_current_function().tables[table];
+                let base = state.resolve_global_value(table.base_gv)?;
+                let bound = state.resolve_global_value(table.bound_gv)?;
+                let index_ty = table.index_type;
+                let element_size = V::int(u64::from(table.element_size) as i128, index_ty)?;
+                let inst_offset = V::int(i32::from(offset) as i128, index_ty)?;
+
+                let byte_offset = arg(0)?.mul(element_size.clone())?.add(inst_offset)?;
+                let bound_bytes = bound.mul(element_size)?;
+                if byte_offset.gt(&bound_bytes)? {
+                    return Ok(ControlFlow::Trap(CraneliftTrap::User(
+                        TrapCode::HeapOutOfBounds,
+                    )));
+                }
+
+                assign(base.add(byte_offset)?)
+            } else {
+                unreachable!()
+            }
+        }
         Opcode::Iconst => assign(Value::int(imm().into_int()?, ctrl_ty)?),
         Opcode::F32const => assign(imm()),
         Opcode::F64const => assign(imm()),
@@ -404,7 +466,6 @@ where
             assign(Value::or(mask_a, mask_b)?)
         }
         Opcode::Copy => assign(arg(0)?),
-        Opcode::IfcmpSp => unimplemented!("IfcmpSp"),
         Opcode::Icmp => assign(icmp(
             ctrl_ty,
             inst.cond_code().unwrap(),
@@ -443,24 +504,52 @@ where
             }
             ControlFlow::Continue
         }
-        Opcode::Imin => choose(Value::gt(&arg(1)?, &arg(0)?)?, arg(0)?, arg(1)?),
-        Opcode::Umin => choose(
-            Value::gt(
-                &arg(1)?.convert(ValueConversionKind::ToUnsigned)?,
-                &arg(0)?.convert(ValueConversionKind::ToUnsigned)?,
-            )?,
-            arg(0)?,
-            arg(1)?,
-        ),
-        Opcode::Imax => choose(Value::gt(&arg(0)?, &arg(1)?)?, arg(0)?, arg(1)?),
-        Opcode::Umax => choose(
-            Value::gt(
-                &arg(0)?.convert(ValueConversionKind::ToUnsigned)?,
-                &arg(1)?.convert(ValueConversionKind::ToUnsigned)?,
-            )?,
-            arg(0)?,
-            arg(1)?,
-        ),
+        Opcode::Imin => {
+            if ctrl_ty.is_vector() {
+                let icmp = icmp(ctrl_ty, IntCC::SignedGreaterThan, &arg(1)?, &arg(0)?)?;
+                assign(vselect(&icmp, &arg(0)?, &arg(1)?, ctrl_ty)?)
+            } else {
+                choose(Value::gt(&arg(1)?, &arg(0)?)?, arg(0)?, arg(1)?)
+            }
+        }
+        Opcode::Umin => {
+            if ctrl_ty.is_vector() {
+                let icmp = icmp(ctrl_ty, IntCC::UnsignedGreaterThan, &arg(1)?, &arg(0)?)?;
+                assign(vselect(&icmp, &arg(0)?, &arg(1)?, ctrl_ty)?)
+            } else {
+                choose(
+                    Value::gt(
+                        &arg(1)?.convert(ValueConversionKind::ToUnsigned)?,
+                        &arg(0)?.convert(ValueConversionKind::ToUnsigned)?,
+                    )?,
+                    arg(0)?,
+                    arg(1)?,
+                )
+            }
+        }
+        Opcode::Imax => {
+            if ctrl_ty.is_vector() {
+                let icmp = icmp(ctrl_ty, IntCC::SignedGreaterThan, &arg(0)?, &arg(1)?)?;
+                assign(vselect(&icmp, &arg(0)?, &arg(1)?, ctrl_ty)?)
+            } else {
+                choose(Value::gt(&arg(0)?, &arg(1)?)?, arg(0)?, arg(1)?)
+            }
+        }
+        Opcode::Umax => {
+            if ctrl_ty.is_vector() {
+                let icmp = icmp(ctrl_ty, IntCC::UnsignedGreaterThan, &arg(0)?, &arg(1)?)?;
+                assign(vselect(&icmp, &arg(0)?, &arg(1)?, ctrl_ty)?)
+            } else {
+                choose(
+                    Value::gt(
+                        &arg(0)?.convert(ValueConversionKind::ToUnsigned)?,
+                        &arg(1)?.convert(ValueConversionKind::ToUnsigned)?,
+                    )?,
+                    arg(0)?,
+                    arg(1)?,
+                )
+            }
+        }
         Opcode::AvgRound => {
             let sum = Value::add(arg(0)?, arg(1)?)?;
             let one = Value::int(1, arg(0)?.ty())?;
@@ -502,7 +591,7 @@ where
         Opcode::Iabs => {
             let (min_val, _) = ctrl_ty.lane_type().bounds(true);
             let min_val: V = Value::int(min_val as i128, ctrl_ty.lane_type())?;
-            let arg0 = extractlanes(&arg(0)?, ctrl_ty.lane_type())?;
+            let arg0 = extractlanes(&arg(0)?, ctrl_ty)?;
             let new_vec = arg0
                 .into_iter()
                 .map(|lane| {
@@ -529,8 +618,8 @@ where
             } else {
                 ValueConversionKind::SignExtend(double_length)
             };
-            let arg0 = extractlanes(&arg(0)?, ctrl_ty.lane_type())?;
-            let arg1 = extractlanes(&arg(1)?, ctrl_ty.lane_type())?;
+            let arg0 = extractlanes(&arg(0)?, ctrl_ty)?;
+            let arg1 = extractlanes(&arg(1)?, ctrl_ty)?;
 
             let res = arg0
                 .into_iter()
@@ -552,9 +641,9 @@ where
         Opcode::Srem => binary_can_trap(Value::rem, arg(0)?, arg(1)?)?,
         Opcode::IaddImm => binary(Value::add, arg(0)?, imm_as_ctrl_ty()?)?,
         Opcode::ImulImm => binary(Value::mul, arg(0)?, imm_as_ctrl_ty()?)?,
-        Opcode::UdivImm => binary_unsigned_can_trap(Value::div, arg(0)?, imm())?,
+        Opcode::UdivImm => binary_unsigned_can_trap(Value::div, arg(0)?, imm_as_ctrl_ty()?)?,
         Opcode::SdivImm => binary_can_trap(Value::div, arg(0)?, imm_as_ctrl_ty()?)?,
-        Opcode::UremImm => binary_unsigned_can_trap(Value::rem, arg(0)?, imm())?,
+        Opcode::UremImm => binary_unsigned_can_trap(Value::rem, arg(0)?, imm_as_ctrl_ty()?)?,
         Opcode::SremImm => binary_can_trap(Value::rem, arg(0)?, imm_as_ctrl_ty()?)?,
         Opcode::IrsubImm => binary(Value::sub, imm_as_ctrl_ty()?, arg(0)?)?,
         Opcode::IaddCin => choose(
@@ -616,10 +705,10 @@ where
         Opcode::RotlImm => binary(Value::rotl, arg(0)?, imm_as_ctrl_ty()?)?,
         Opcode::RotrImm => binary(Value::rotr, arg(0)?, imm_as_ctrl_ty()?)?,
         Opcode::Ishl => binary(Value::shl, arg(0)?, arg(1)?)?,
-        Opcode::Ushr => binary(Value::ushr, arg(0)?, arg(1)?)?,
+        Opcode::Ushr => binary_unsigned(Value::ushr, arg(0)?, arg(1)?)?,
         Opcode::Sshr => binary(Value::ishr, arg(0)?, arg(1)?)?,
         Opcode::IshlImm => binary(Value::shl, arg(0)?, imm_as_ctrl_ty()?)?,
-        Opcode::UshrImm => binary(Value::ushr, arg(0)?, imm_as_ctrl_ty()?)?,
+        Opcode::UshrImm => binary_unsigned(Value::ushr, arg(0)?, imm_as_ctrl_ty()?)?,
         Opcode::SshrImm => binary(Value::ishr, arg(0)?, imm_as_ctrl_ty()?)?,
         Opcode::Bitrev => assign(Value::reverse_bits(arg(0)?)?),
         Opcode::Clz => assign(arg(0)?.leading_zeros()?),
@@ -636,7 +725,7 @@ where
             let count = if arg(0)?.ty().is_int() {
                 arg(0)?.count_ones()?
             } else {
-                let lanes = extractlanes(&arg(0)?, ctrl_ty.lane_type())?
+                let lanes = extractlanes(&arg(0)?, ctrl_ty)?
                     .into_iter()
                     .map(|lane| lane.count_ones())
                     .collect::<ValueResult<SimdVec<V>>>()?;
@@ -644,10 +733,25 @@ where
             };
             assign(count)
         }
-        Opcode::Fcmp => assign(Value::bool(
-            fcmp(inst.fp_cond_code().unwrap(), &arg(0)?, &arg(1)?)?,
-            ctrl_ty.as_bool(),
-        )?),
+
+        Opcode::Fcmp => {
+            let arg0 = extractlanes(&arg(0)?, ctrl_ty)?;
+            let arg1 = extractlanes(&arg(1)?, ctrl_ty)?;
+
+            assign(vectorizelanes(
+                &(arg0
+                    .into_iter()
+                    .zip(arg1.into_iter())
+                    .map(|(x, y)| {
+                        V::bool(
+                            fcmp(inst.fp_cond_code().unwrap(), &x, &y).unwrap(),
+                            ctrl_ty.lane_type().as_bool(),
+                        )
+                    })
+                    .collect::<ValueResult<SimdVec<V>>>()?),
+                ctrl_ty,
+            )?)
+        }
         Opcode::Ffcmp => {
             let arg0 = arg(0)?;
             let arg1 = arg(1)?;
@@ -678,27 +782,53 @@ where
         Opcode::Fsub => binary(Value::sub, arg(0)?, arg(1)?)?,
         Opcode::Fmul => binary(Value::mul, arg(0)?, arg(1)?)?,
         Opcode::Fdiv => binary(Value::div, arg(0)?, arg(1)?)?,
-        Opcode::Sqrt => unimplemented!("Sqrt"),
-        Opcode::Fma => unimplemented!("Fma"),
-        Opcode::Fneg => binary(Value::sub, Value::float(0, ctrl_ty)?, arg(0)?)?,
-        Opcode::Fabs => unimplemented!("Fabs"),
-        Opcode::Fcopysign => unimplemented!("Fcopysign"),
-        Opcode::Fmin => choose(
-            Value::is_nan(&arg(0)?)? || Value::lt(&arg(0)?, &arg(1)?)?,
-            arg(0)?,
-            arg(1)?,
-        ),
-        Opcode::FminPseudo => unimplemented!("FminPseudo"),
-        Opcode::Fmax => choose(
-            Value::is_nan(&arg(0)?)? || Value::gt(&arg(0)?, &arg(1)?)?,
-            arg(0)?,
-            arg(1)?,
-        ),
-        Opcode::FmaxPseudo => unimplemented!("FmaxPseudo"),
-        Opcode::Ceil => unimplemented!("Ceil"),
-        Opcode::Floor => unimplemented!("Floor"),
-        Opcode::Trunc => unimplemented!("Trunc"),
-        Opcode::Nearest => unimplemented!("Nearest"),
+        Opcode::Sqrt => assign(Value::sqrt(arg(0)?)?),
+        Opcode::Fma => {
+            let arg0 = extractlanes(&arg(0)?, ctrl_ty)?;
+            let arg1 = extractlanes(&arg(1)?, ctrl_ty)?;
+            let arg2 = extractlanes(&arg(2)?, ctrl_ty)?;
+
+            assign(vectorizelanes(
+                &(arg0
+                    .into_iter()
+                    .zip(arg1.into_iter())
+                    .zip(arg2.into_iter())
+                    .map(|((x, y), z)| Value::fma(x, y, z))
+                    .collect::<ValueResult<SimdVec<V>>>()?),
+                ctrl_ty,
+            )?)
+        }
+        Opcode::Fneg => assign(Value::neg(arg(0)?)?),
+        Opcode::Fabs => assign(Value::abs(arg(0)?)?),
+        Opcode::Fcopysign => binary(Value::copysign, arg(0)?, arg(1)?)?,
+        Opcode::Fmin => assign(match (arg(0)?, arg(1)?) {
+            (a, _) if a.is_nan()? => a,
+            (_, b) if b.is_nan()? => b,
+            (a, b) if a.is_zero()? && b.is_zero()? && a.is_negative()? => a,
+            (a, b) if a.is_zero()? && b.is_zero()? && b.is_negative()? => b,
+            (a, b) => a.min(b)?,
+        }),
+        Opcode::FminPseudo => assign(match (arg(0)?, arg(1)?) {
+            (a, b) if a.is_nan()? || b.is_nan()? => a,
+            (a, b) if a.is_zero()? && b.is_zero()? => a,
+            (a, b) => a.min(b)?,
+        }),
+        Opcode::Fmax => assign(match (arg(0)?, arg(1)?) {
+            (a, _) if a.is_nan()? => a,
+            (_, b) if b.is_nan()? => b,
+            (a, b) if a.is_zero()? && b.is_zero()? && a.is_negative()? => b,
+            (a, b) if a.is_zero()? && b.is_zero()? && b.is_negative()? => a,
+            (a, b) => a.max(b)?,
+        }),
+        Opcode::FmaxPseudo => assign(match (arg(0)?, arg(1)?) {
+            (a, b) if a.is_nan()? || b.is_nan()? => a,
+            (a, b) if a.is_zero()? && b.is_zero()? => a,
+            (a, b) => a.max(b)?,
+        }),
+        Opcode::Ceil => assign(Value::ceil(arg(0)?)?),
+        Opcode::Floor => assign(Value::floor(arg(0)?)?),
+        Opcode::Trunc => assign(Value::trunc(arg(0)?)?),
+        Opcode::Nearest => assign(Value::nearest(arg(0)?)?),
         Opcode::IsNull => unimplemented!("IsNull"),
         Opcode::IsInvalid => unimplemented!("IsInvalid"),
         Opcode::Trueif => choose(
@@ -715,15 +845,22 @@ where
         | Opcode::RawBitcast
         | Opcode::ScalarToVector
         | Opcode::Breduce
-        | Opcode::Bextend
-        | Opcode::Bint
-        | Opcode::Ireduce => assign(Value::convert(
+        | Opcode::Bextend => assign(Value::convert(
             arg(0)?,
             ValueConversionKind::Exact(ctrl_ty),
         )?),
+        Opcode::Ireduce => assign(Value::convert(
+            arg(0)?,
+            ValueConversionKind::Truncate(ctrl_ty),
+        )?),
+        Opcode::Bint => {
+            let bool = arg(0)?.into_bool()?;
+            let int = if bool { 1 } else { 0 };
+            assign(Value::int(int, ctrl_ty)?)
+        }
         Opcode::Snarrow | Opcode::Unarrow | Opcode::Uunarrow => {
-            let arg0 = extractlanes(&arg(0)?, ctrl_ty.lane_type())?;
-            let arg1 = extractlanes(&arg(1)?, ctrl_ty.lane_type())?;
+            let arg0 = extractlanes(&arg(0)?, ctrl_ty)?;
+            let arg1 = extractlanes(&arg(1)?, ctrl_ty)?;
             let new_type = ctrl_ty.split_lanes().unwrap();
             let (min, max) = new_type.bounds(inst.opcode() == Opcode::Snarrow);
             let mut min: V = Value::int(min as i128, ctrl_ty.lane_type())?;
@@ -754,7 +891,7 @@ where
         Opcode::Bmask => assign({
             let bool = arg(0)?;
             let bool_ty = ctrl_ty.as_bool_pedantic();
-            let lanes = extractlanes(&bool, bool_ty.lane_type())?
+            let lanes = extractlanes(&bool, bool_ty)?
                 .into_iter()
                 .map(|lane| lane.convert(ValueConversionKind::Exact(ctrl_ty.lane_type())))
                 .collect::<ValueResult<SimdVec<V>>>()?;
@@ -810,23 +947,20 @@ where
         }
         Opcode::Insertlane => {
             let idx = imm().into_int()? as usize;
-            let mut vector = extractlanes(&arg(0)?, ctrl_ty.lane_type())?;
+            let mut vector = extractlanes(&arg(0)?, ctrl_ty)?;
             vector[idx] = arg(1)?;
             assign(vectorizelanes(&vector, ctrl_ty)?)
         }
         Opcode::Extractlane => {
             let idx = imm().into_int()? as usize;
-            let lanes = extractlanes(&arg(0)?, ctrl_ty.lane_type())?;
+            let lanes = extractlanes(&arg(0)?, ctrl_ty)?;
             assign(lanes[idx].clone())
         }
         Opcode::VhighBits => {
             // `ctrl_ty` controls the return type for this, so the input type
             // must be retrieved via `inst_context`.
-            let lane_type = inst_context
-                .type_of(inst_context.args()[0])
-                .unwrap()
-                .lane_type();
-            let a = extractlanes(&arg(0)?, lane_type)?;
+            let vector_type = inst_context.type_of(inst_context.args()[0]).unwrap();
+            let a = extractlanes(&arg(0)?, vector_type)?;
             let mut result: i128 = 0;
             for (i, val) in a.into_iter().enumerate() {
                 let val = val.reverse_bits()?.into_int()?; // MSB -> LSB
@@ -836,20 +970,7 @@ where
         }
         Opcode::Vsplit => unimplemented!("Vsplit"),
         Opcode::Vconcat => unimplemented!("Vconcat"),
-        Opcode::Vselect => {
-            let c = extractlanes(&arg(0)?, ctrl_ty.lane_type())?;
-            let x = extractlanes(&arg(1)?, ctrl_ty.lane_type())?;
-            let y = extractlanes(&arg(2)?, ctrl_ty.lane_type())?;
-            let mut new_vec = SimdVec::new();
-            for (c, (x, y)) in c.into_iter().zip(x.into_iter().zip(y.into_iter())) {
-                if Value::eq(&c, &Value::int(0, ctrl_ty.lane_type())?)? {
-                    new_vec.push(y);
-                } else {
-                    new_vec.push(x);
-                }
-            }
-            assign(vectorizelanes(&new_vec, ctrl_ty)?)
-        }
+        Opcode::Vselect => assign(vselect(&arg(0)?, &arg(1)?, &arg(2)?, ctrl_ty)?),
         Opcode::VanyTrue => assign(fold_vector(
             arg(0)?,
             ctrl_ty,
@@ -873,7 +994,7 @@ where
                 }
                 _ => unreachable!(),
             };
-            let vec_iter = extractlanes(&arg(0)?, ctrl_ty.lane_type())?.into_iter();
+            let vec_iter = extractlanes(&arg(0)?, ctrl_ty)?.into_iter();
             let new_vec = match inst.opcode() {
                 Opcode::SwidenLow | Opcode::UwidenLow => vec_iter
                     .take(new_type.lane_count() as usize)
@@ -909,8 +1030,8 @@ where
         Opcode::WideningPairwiseDotProductS => {
             let ctrl_ty = types::I16X8;
             let new_type = ctrl_ty.merge_lanes().unwrap();
-            let arg0 = extractlanes(&arg(0)?, ctrl_ty.lane_type())?;
-            let arg1 = extractlanes(&arg(1)?, ctrl_ty.lane_type())?;
+            let arg0 = extractlanes(&arg(0)?, ctrl_ty)?;
+            let arg1 = extractlanes(&arg(1)?, ctrl_ty)?;
             let new_vec = arg0
                 .chunks(2)
                 .into_iter()
@@ -929,8 +1050,8 @@ where
         Opcode::SqmulRoundSat => {
             let lane_type = ctrl_ty.lane_type();
             let double_width = ctrl_ty.double_width().unwrap().lane_type();
-            let arg0 = extractlanes(&arg(0)?, lane_type)?;
-            let arg1 = extractlanes(&arg(1)?, lane_type)?;
+            let arg0 = extractlanes(&arg(0)?, ctrl_ty)?;
+            let arg1 = extractlanes(&arg(1)?, ctrl_ty)?;
             let (min, max) = lane_type.bounds(true);
             let min: V = Value::int(min as i128, double_width)?;
             let max: V = Value::int(max as i128, double_width)?;
@@ -955,6 +1076,12 @@ where
             assign(vectorizelanes(&new_vec, ctrl_ty)?)
         }
         Opcode::IaddPairwise => assign(binary_pairwise(arg(0)?, arg(1)?, ctrl_ty, Value::add)?),
+        Opcode::ExtractVector => {
+            unimplemented!("ExtractVector not supported");
+        }
+        Opcode::GetFramePointer => unimplemented!("GetFramePointer"),
+        Opcode::GetStackPointer => unimplemented!("GetStackPointer"),
+        Opcode::GetReturnAddress => unimplemented!("GetReturnAddress"),
     })
 }
 
@@ -1063,9 +1190,8 @@ where
     };
 
     let dst_ty = ctrl_ty.as_bool();
-    let lane_type = ctrl_ty.lane_type();
-    let left = extractlanes(left, lane_type)?;
-    let right = extractlanes(right, lane_type)?;
+    let left = extractlanes(left, ctrl_ty)?;
+    let right = extractlanes(right, ctrl_ty)?;
 
     let res = left
         .into_iter()
@@ -1111,10 +1237,11 @@ type SimdVec<V> = SmallVec<[V; 4]>;
 
 /// Converts a SIMD vector value into a Rust array of [Value] for processing.
 /// If `x` is a scalar, it will be returned as a single-element array.
-fn extractlanes<V>(x: &V, lane_type: types::Type) -> ValueResult<SimdVec<V>>
+fn extractlanes<V>(x: &V, vector_type: types::Type) -> ValueResult<SimdVec<V>>
 where
     V: Value,
 {
+    let lane_type = vector_type.lane_type();
     let mut lanes = SimdVec::new();
     // Wrap scalar values as a single-element vector and return.
     if !x.ty().is_vector() {
@@ -1125,23 +1252,22 @@ where
     let iterations = match lane_type {
         types::I8 | types::B1 | types::B8 => 1,
         types::I16 | types::B16 => 2,
-        types::I32 | types::B32 => 4,
-        types::I64 | types::B64 => 8,
-        _ => unimplemented!("Only 128-bit vectors are currently supported."),
+        types::I32 | types::B32 | types::F32 => 4,
+        types::I64 | types::B64 | types::F64 => 8,
+        _ => unimplemented!("vectors with lanes wider than 64-bits are currently unsupported."),
     };
 
     let x = x.into_array()?;
-    for (i, _) in x.iter().enumerate() {
+    for i in 0..vector_type.lane_count() {
         let mut lane: i128 = 0;
-        if i % iterations != 0 {
-            continue;
-        }
         for j in 0..iterations {
-            lane += (x[i + j] as i128) << (8 * j);
+            lane += (x[((i * iterations) + j) as usize] as i128) << (8 * j);
         }
 
         let lane_val: V = if lane_type.is_bool() {
             Value::bool(lane != 0, lane_type)?
+        } else if lane_type.is_float() {
+            Value::float(lane as u64, lane_type)?
         } else {
             Value::int(lane, lane_type)?
         };
@@ -1165,9 +1291,9 @@ where
     let iterations = match lane_type {
         types::I8 | types::B1 | types::B8 => 1,
         types::I16 | types::B16 => 2,
-        types::I32 | types::B32 => 4,
-        types::I64 | types::B64 => 8,
-        _ => unimplemented!("Only 128-bit vectors are currently supported."),
+        types::I32 | types::B32 | types::F32 => 4,
+        types::I64 | types::B64 | types::F64 => 8,
+        _ => unimplemented!("vectors with lanes wider than 64-bits are currently unsupported."),
     };
     let mut result: [u8; 16] = [0; 16];
     for (i, val) in x.iter().enumerate() {
@@ -1189,9 +1315,7 @@ where
     V: Value,
     F: FnMut(V, V) -> ValueResult<V>,
 {
-    extractlanes(&v, ty.lane_type())?
-        .into_iter()
-        .try_fold(init, op)
+    extractlanes(&v, ty)?.into_iter().try_fold(init, op)
 }
 
 /// Performs the supplied binary arithmetic `op` on two SIMD vectors.
@@ -1200,8 +1324,8 @@ where
     V: Value,
     F: Fn(V, V) -> ValueResult<V>,
 {
-    let arg0 = extractlanes(&x, vector_type.lane_type())?;
-    let arg1 = extractlanes(&y, vector_type.lane_type())?;
+    let arg0 = extractlanes(&x, vector_type)?;
+    let arg1 = extractlanes(&y, vector_type)?;
 
     let result = arg0
         .into_iter()
@@ -1226,8 +1350,8 @@ where
     V: Value,
     F: Fn(V, V) -> ValueResult<V>,
 {
-    let arg0 = extractlanes(&x, vector_type.lane_type())?;
-    let arg1 = extractlanes(&y, vector_type.lane_type())?;
+    let arg0 = extractlanes(&x, vector_type)?;
+    let arg1 = extractlanes(&y, vector_type)?;
 
     let result = arg0
         .chunks(2)
@@ -1236,4 +1360,22 @@ where
         .collect::<ValueResult<SimdVec<V>>>()?;
 
     vectorizelanes(&result, vector_type)
+}
+
+fn vselect<V>(c: &V, x: &V, y: &V, vector_type: types::Type) -> ValueResult<V>
+where
+    V: Value,
+{
+    let c = extractlanes(c, vector_type)?;
+    let x = extractlanes(x, vector_type)?;
+    let y = extractlanes(y, vector_type)?;
+    let mut new_vec = SimdVec::new();
+    for (c, (x, y)) in c.into_iter().zip(x.into_iter().zip(y.into_iter())) {
+        if Value::eq(&c, &Value::int(0, vector_type.lane_type())?)? {
+            new_vec.push(y);
+        } else {
+            new_vec.push(x);
+        }
+    }
+    vectorizelanes(&new_vec, vector_type)
 }

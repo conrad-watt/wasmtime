@@ -11,10 +11,12 @@
 //! panicking.
 
 pub mod dummy;
+mod stacks;
 
 use crate::generators;
 use arbitrary::Arbitrary;
 use log::debug;
+pub use stacks::check_stacks;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -124,13 +126,8 @@ pub fn instantiate(wasm: &[u8], known_valid: bool, config: &generators::Config, 
 
     let mut timeout_state = SignalOnDrop::default();
     match timeout {
-        Timeout::Fuel(fuel) => {
-            // consume the default fuel in the store ...
-            let remaining = store.consume_fuel(0).unwrap();
-            store.consume_fuel(remaining - 1).unwrap();
-            // ... then add back in how much fuel we're allowing here
-            store.add_fuel(fuel).unwrap();
-        }
+        Timeout::Fuel(fuel) => set_fuel(&mut store, fuel),
+
         // If a timeout is requested then we spawn a helper thread to wait for
         // the requested time and then send us a signal to get interrupted. We
         // also arrange for the thread's sleep to get interrupted if we return
@@ -546,25 +543,27 @@ pub fn spectest(mut fuzz_config: generators::Config, test: generators::SpecTest)
 }
 
 /// Execute a series of `table.get` and `table.set` operations.
-pub fn table_ops(mut fuzz_config: generators::Config, ops: generators::table_ops::TableOps) {
+///
+/// Returns the number of `gc` operations which occurred throughout the test
+/// case -- used to test below that gc happens reasonably soon and eventually.
+pub fn table_ops(
+    mut fuzz_config: generators::Config,
+    ops: generators::table_ops::TableOps,
+) -> usize {
     let expected_drops = Arc::new(AtomicUsize::new(ops.num_params as usize));
     let num_dropped = Arc::new(AtomicUsize::new(0));
 
+    let num_gcs = Arc::new(AtomicUsize::new(0));
     {
         fuzz_config.wasmtime.consume_fuel = true;
         let mut store = fuzz_config.to_store();
-
-        // consume the default fuel in the store ...
-        let remaining = store.consume_fuel(0).unwrap();
-        store.consume_fuel(remaining - 1).unwrap();
-        // ... then add back in how much fuel we're allowing here
-        store.add_fuel(1_000).unwrap();
+        set_fuel(&mut store, 1_000);
 
         let wasm = ops.to_wasm_binary();
         log_wasm(&wasm);
         let module = match compile_module(store.engine(), &wasm, false, &fuzz_config) {
             Some(m) => m,
-            None => return,
+            None => return 0,
         };
 
         let mut linker = Linker::new(store.engine());
@@ -573,7 +572,6 @@ pub fn table_ops(mut fuzz_config: generators::Config, ops: generators::table_ops
         // test case.
         const MAX_GCS: usize = 5;
 
-        let num_gcs = AtomicUsize::new(0);
         linker
             .define(
                 "",
@@ -590,19 +588,23 @@ pub fn table_ops(mut fuzz_config: generators::Config, ops: generators::table_ops
                     {
                         let num_dropped = num_dropped.clone();
                         let expected_drops = expected_drops.clone();
+                        let num_gcs = num_gcs.clone();
                         move |mut caller: Caller<'_, StoreLimits>, _params, results| {
                             log::info!("table_ops: GC");
                             if num_gcs.fetch_add(1, SeqCst) < MAX_GCS {
                                 caller.gc();
                             }
 
+                            let a = ExternRef::new(CountDrops(num_dropped.clone()));
+                            let b = ExternRef::new(CountDrops(num_dropped.clone()));
+                            let c = ExternRef::new(CountDrops(num_dropped.clone()));
+
+                            log::info!("table_ops: make_refs() -> ({:p}, {:p}, {:p})", a, b, c);
+
                             expected_drops.fetch_add(3, SeqCst);
-                            results[0] =
-                                Some(ExternRef::new(CountDrops(num_dropped.clone()))).into();
-                            results[1] =
-                                Some(ExternRef::new(CountDrops(num_dropped.clone()))).into();
-                            results[2] =
-                                Some(ExternRef::new(CountDrops(num_dropped.clone()))).into();
+                            results[0] = Some(a).into();
+                            results[1] = Some(b).into();
+                            results[2] = Some(c).into();
                             Ok(())
                         }
                     },
@@ -614,7 +616,22 @@ pub fn table_ops(mut fuzz_config: generators::Config, ops: generators::table_ops
             .func_wrap("", "take_refs", {
                 let expected_drops = expected_drops.clone();
                 move |a: Option<ExternRef>, b: Option<ExternRef>, c: Option<ExternRef>| {
-                    log::info!("table_ops: take_refs");
+                    log::info!(
+                        "table_ops: take_refs({}, {}, {})",
+                        a.as_ref().map_or_else(
+                            || format!("{:p}", std::ptr::null::<()>()),
+                            |r| format!("{:p}", *r)
+                        ),
+                        b.as_ref().map_or_else(
+                            || format!("{:p}", std::ptr::null::<()>()),
+                            |r| format!("{:p}", *r)
+                        ),
+                        c.as_ref().map_or_else(
+                            || format!("{:p}", std::ptr::null::<()>()),
+                            |r| format!("{:p}", *r)
+                        ),
+                    );
+
                     // Do the assertion on each ref's inner data, even though it
                     // all points to the same atomic, so that if we happen to
                     // run into a use-after-free bug with one of these refs we
@@ -673,14 +690,33 @@ pub fn table_ops(mut fuzz_config: generators::Config, ops: generators::table_ops
         let args: Vec<_> = (0..ops.num_params)
             .map(|_| Val::ExternRef(Some(ExternRef::new(CountDrops(num_dropped.clone())))))
             .collect();
-        let _ = run.call(&mut store, &args, &mut []);
+
+        // The generated function should always return a trap. The only two
+        // valid traps are table-out-of-bounds which happens through `table.get`
+        // and `table.set` generated or an out-of-fuel trap. Otherwise any other
+        // error is unexpected and should fail fuzzing.
+        let trap = run
+            .call(&mut store, &args, &mut [])
+            .unwrap_err()
+            .downcast::<Trap>()
+            .unwrap();
+
+        match trap.trap_code() {
+            Some(TrapCode::TableOutOfBounds) => {}
+            None if trap
+                .to_string()
+                .contains("all fuel consumed by WebAssembly") => {}
+            _ => {
+                panic!("unexpected trap: {}", trap);
+            }
+        }
 
         // Do a final GC after running the Wasm.
         store.gc();
     }
 
     assert_eq!(num_dropped.load(SeqCst), expected_drops.load(SeqCst));
-    return;
+    return num_gcs.load(SeqCst);
 
     struct CountDrops(Arc<AtomicUsize>);
 
@@ -689,6 +725,38 @@ pub fn table_ops(mut fuzz_config: generators::Config, ops: generators::table_ops
             self.0.fetch_add(1, SeqCst);
         }
     }
+}
+
+// Test that the `table_ops` fuzzer eventually runs the gc function in the host.
+// We've historically had issues where this fuzzer accidentally wasn't fuzzing
+// anything for a long time so this is an attempt to prevent that from happening
+// again.
+#[test]
+fn table_ops_eventually_gcs() {
+    use arbitrary::Unstructured;
+    use rand::prelude::*;
+
+    // Skip if we're under emulation because some fuzz configurations will do
+    // large address space reservations that QEMU doesn't handle well.
+    if std::env::var("WASMTIME_TEST_NO_HOG_MEMORY").is_ok() {
+        return;
+    }
+
+    let mut rng = SmallRng::seed_from_u64(0);
+    let mut buf = vec![0; 2048];
+    let n = 100;
+    for _ in 0..n {
+        rng.fill_bytes(&mut buf);
+        let u = Unstructured::new(&buf);
+
+        if let Ok((config, test)) = Arbitrary::arbitrary_take_rest(u) {
+            if table_ops(config, test) > 0 {
+                return;
+            }
+        }
+    }
+
+    panic!("after {n} runs nothing ever gc'd, something is probably wrong");
 }
 
 /// Perform differential execution between Cranelift and wasmi, diffing the
@@ -718,17 +786,11 @@ pub fn differential_wasmi_execution(wasm: &[u8], config: &generators::Config) ->
     // Introspect wasmtime module to find name of an exported function and of an
     // exported memory.
     let (func_name, ty) = first_exported_function(&wasmtime_module)?;
-    let memory_name = first_exported_memory(&wasmtime_module)?;
 
-    let wasmi_mem_export = wasmi_instance.export_by_name(memory_name).unwrap();
-    let wasmi_mem = wasmi_mem_export.as_memory().unwrap();
     let wasmi_main_export = wasmi_instance.export_by_name(func_name).unwrap();
     let wasmi_main = wasmi_main_export.as_func().unwrap();
     let wasmi_val = wasmi::FuncInstance::invoke(&wasmi_main, &[], &mut wasmi::NopExternals);
 
-    let wasmtime_mem = wasmtime_instance
-        .get_memory(&mut wasmtime_store, memory_name)
-        .expect("memory export is present");
     let wasmtime_main = wasmtime_instance
         .get_func(&mut wasmtime_store, func_name)
         .expect("function export is present");
@@ -758,6 +820,17 @@ pub fn differential_wasmi_execution(wasm: &[u8], config: &generators::Config) ->
             );
         }
     }
+
+    // Compare linear memories if there's an exported linear memory
+    let memory_name = match first_exported_memory(&wasmtime_module) {
+        Some(name) => name,
+        None => return Some(()),
+    };
+    let wasmi_mem_export = wasmi_instance.export_by_name(memory_name).unwrap();
+    let wasmi_mem = wasmi_mem_export.as_memory().unwrap();
+    let wasmtime_mem = wasmtime_instance
+        .get_memory(&mut wasmtime_store, memory_name)
+        .expect("memory export is present");
 
     if wasmi_mem.current_size().0 != wasmtime_mem.size(&wasmtime_store) as usize {
         panic!("resulting memories are not the same size");
@@ -986,4 +1059,79 @@ impl Drop for SignalOnDrop {
             thread.join().unwrap();
         }
     }
+}
+
+fn set_fuel<T>(store: &mut Store<T>, fuel: u64) {
+    // Determine the amount of fuel already within the store, if any, and
+    // add/consume as appropriate to set the remaining amount to` fuel`.
+    let remaining = store.consume_fuel(0).unwrap();
+    if fuel > remaining {
+        store.add_fuel(fuel - remaining).unwrap();
+    } else {
+        store.consume_fuel(remaining - fuel).unwrap();
+    }
+    // double-check that the store has the expected amount of fuel remaining
+    assert_eq!(store.consume_fuel(0).unwrap(), fuel);
+}
+
+/// Generate and execute a `crate::generators::component_types::TestCase` using the specified `input` to create
+/// arbitrary types and values.
+pub fn dynamic_component_api_target(input: &mut arbitrary::Unstructured) -> arbitrary::Result<()> {
+    use crate::generators::component_types;
+    use anyhow::Result;
+    use component_fuzz_util::{TestCase, EXPORT_FUNCTION, IMPORT_FUNCTION};
+    use component_test_util::FuncExt;
+    use wasmtime::component::{Component, Linker, Val};
+
+    crate::init_fuzzing();
+
+    let case = input.arbitrary::<TestCase>()?;
+
+    let engine = component_test_util::engine();
+    let mut store = Store::new(&engine, (Box::new([]) as Box<[Val]>, None));
+    let wat = case.declarations().make_component();
+    let wat = wat.as_bytes();
+    log_wasm(wat);
+    let component = Component::new(&engine, wat).unwrap();
+    let mut linker = Linker::new(&engine);
+
+    linker
+        .root()
+        .func_new(&component, IMPORT_FUNCTION, {
+            move |cx: StoreContextMut<'_, (Box<[Val]>, Option<Val>)>, args: &[Val]| -> Result<Val> {
+                log::trace!("received arguments {args:?}");
+                let (expected_args, result) = cx.data();
+                assert_eq!(args.len(), expected_args.len());
+                for (expected, actual) in expected_args.iter().zip(args) {
+                    assert_eq!(expected, actual);
+                }
+                let result = result.as_ref().unwrap().clone();
+                log::trace!("returning result {result:?}");
+                Ok(result)
+            }
+        })
+        .unwrap();
+
+    let instance = linker.instantiate(&mut store, &component).unwrap();
+    let func = instance.get_func(&mut store, EXPORT_FUNCTION).unwrap();
+    let params = func.params(&store);
+    let result = func.result(&store);
+
+    while input.arbitrary()? {
+        let args = params
+            .iter()
+            .map(|ty| component_types::arbitrary_val(ty, input))
+            .collect::<arbitrary::Result<Box<[_]>>>()?;
+
+        let result = component_types::arbitrary_val(&result, input)?;
+
+        *store.data_mut() = (args.clone(), Some(result.clone()));
+
+        log::trace!("passing args {args:?}");
+        let actual = func.call_and_post_return(&mut store, &args).unwrap();
+        log::trace!("received return {actual:?}");
+        assert_eq!(actual, result);
+    }
+
+    Ok(())
 }

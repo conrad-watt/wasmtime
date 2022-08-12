@@ -4,10 +4,10 @@
 
 use crate::subtest::{run_filecheck, Context, SubTest};
 use anyhow::{bail, Result};
-use cranelift_codegen::binemit::CodeInfo;
 use cranelift_codegen::ir;
 use cranelift_reader::{TestCommand, TestOption};
 use log::info;
+use similar::TextDiff;
 use std::borrow::Cow;
 use std::env;
 
@@ -53,17 +53,12 @@ impl SubTest for TestCompile {
         // With `MachBackend`s, we need to explicitly request dissassembly results.
         comp_ctx.set_disasm(true);
 
-        let CodeInfo { total_size, .. } = comp_ctx
+        let compiled_code = comp_ctx
             .compile(isa)
-            .map_err(|e| crate::pretty_anyhow_error(&comp_ctx.func, e))?;
+            .map_err(|e| crate::pretty_anyhow_error(&e.func, e.inner))?;
+        let total_size = compiled_code.code_info().total_size;
 
-        let disasm = comp_ctx
-            .mach_compile_result
-            .as_ref()
-            .unwrap()
-            .disasm
-            .as_ref()
-            .unwrap();
+        let disasm = compiled_code.disasm.as_ref().unwrap();
 
         info!("Generated {} bytes of code:\n{}", total_size, disasm);
 
@@ -102,17 +97,15 @@ fn check_precise_output(text: &str, context: &Context) -> Result<()> {
         "compilation of function on line {} does not match\n\
          the text expectation\n\
          \n\
-         expected:\n\
-         {:#?}\n\
-         actual:\n\
-         {:#?}\n\
+         {}\n\
          \n\
          This test assertion can be automatically updated by setting the\n\
          CRANELIFT_TEST_BLESS=1 environment variable when running this test.
          ",
         context.details.location.line_number,
-        expected,
-        actual,
+        TextDiff::from_slices(&expected, &actual)
+            .unified_diff()
+            .header("expected", "actual")
     )
 }
 

@@ -160,7 +160,7 @@ fn bench_host_to_wasm<Params, Results>(
         let untyped = instance.get_func(&mut *store, name).unwrap();
         let params = typed_params.to_vals();
         let results = typed_results.to_vals();
-        let mut space = vec![ValRaw { i32: 0 }; params.len().max(results.len())];
+        let mut space = vec![ValRaw::i32(0); params.len().max(results.len())];
         b.iter(|| unsafe {
             for (i, param) in params.iter().enumerate() {
                 space[i] = param.to_raw(&mut *store);
@@ -314,15 +314,15 @@ fn wasm_to_host(c: &mut Criterion) {
             let ty = FuncType::new([ValType::I32, ValType::I64], [ValType::F32]);
             unchecked
                 .func_new_unchecked("", "nop-params-and-results", ty, |mut caller, space| {
-                    match Val::from_raw(&mut caller, *space, ValType::I32) {
+                    match Val::from_raw(&mut caller, space[0], ValType::I32) {
                         Val::I32(0) => {}
                         _ => unreachable!(),
                     }
-                    match Val::from_raw(&mut caller, *space.add(1), ValType::I64) {
+                    match Val::from_raw(&mut caller, space[1], ValType::I64) {
                         Val::I64(0) => {}
                         _ => unreachable!(),
                     }
-                    *space = Val::F32(0).to_raw(&mut caller);
+                    space[0] = Val::F32(0).to_raw(&mut caller);
                     Ok(())
                 })
                 .unwrap();
@@ -368,7 +368,7 @@ fn wasm_to_host(c: &mut Criterion) {
         desc: &str,
         is_async: IsAsync,
     ) {
-        group.bench_function(&format!("wasm-to-host - nop - {}", desc), |b| {
+        group.bench_function(&format!("wasm-to-host - {} - nop", desc), |b| {
             let run = instance
                 .get_typed_func::<u64, (), _>(&mut *store, "run-nop")
                 .unwrap();
@@ -383,7 +383,7 @@ fn wasm_to_host(c: &mut Criterion) {
             })
         });
         group.bench_function(
-            &format!("wasm-to-host - nop-params-and-results - {}", desc),
+            &format!("wasm-to-host - {} - nop-params-and-results", desc),
             |b| {
                 let run = instance
                     .get_typed_func::<u64, (), _>(&mut *store, "run-nop-params-and-results")

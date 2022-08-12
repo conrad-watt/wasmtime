@@ -17,7 +17,9 @@ use crate::ast;
 use crate::ast::Ident;
 use crate::error::*;
 use crate::lexer::Pos;
-use std::collections::btree_map::Entry;
+use crate::log;
+use crate::{StableMap, StableSet};
+use std::collections::hash_map::Entry;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -72,7 +74,7 @@ pub struct TypeEnv {
     pub syms: Vec<String>,
 
     /// Map of already-interned symbol names to their `Sym` ids.
-    pub sym_map: BTreeMap<String, Sym>,
+    pub sym_map: StableMap<String, Sym>,
 
     /// Arena of type definitions.
     ///
@@ -80,10 +82,10 @@ pub struct TypeEnv {
     pub types: Vec<Type>,
 
     /// A map from a type name symbol to its `TypeId`.
-    pub type_map: BTreeMap<Sym, TypeId>,
+    pub type_map: StableMap<Sym, TypeId>,
 
     /// The types of constant symbols.
-    pub const_types: BTreeMap<Sym, TypeId>,
+    pub const_types: StableMap<Sym, TypeId>,
 
     /// Type errors that we've found so far during type checking.
     pub errors: Vec<Error>,
@@ -187,7 +189,7 @@ pub struct TermEnv {
     pub terms: Vec<Term>,
 
     /// A map from am interned `Term`'s name to its `TermId`.
-    pub term_map: BTreeMap<Sym, TermId>,
+    pub term_map: StableMap<Sym, TermId>,
 
     /// Arena of interned rules defined in this ISLE program.
     ///
@@ -197,7 +199,7 @@ pub struct TermEnv {
     /// Map from (inner_ty, outer_ty) pairs to term IDs, giving the
     /// defined implicit type-converter terms we can try to use to fit
     /// types together.
-    pub converters: BTreeMap<(TypeId, TypeId), TermId>,
+    pub converters: StableMap<(TypeId, TypeId), TermId>,
 }
 
 /// A term.
@@ -447,7 +449,7 @@ pub enum Pattern {
 
     /// Match the current value against a constant integer of the given integer
     /// type.
-    ConstInt(TypeId, i64),
+    ConstInt(TypeId, i128),
 
     /// Match the current value against a constant primitive value of the given
     /// primitive type.
@@ -472,7 +474,7 @@ pub enum Expr {
     /// Get the value of a variable that was bound in the left-hand side.
     Var(TypeId, VarId),
     /// Get a constant integer.
-    ConstInt(TypeId, i64),
+    ConstInt(TypeId, i128),
     /// Get a constant primitive.
     ConstPrim(TypeId, Sym),
     /// Evaluate the nested expressions and bind their results to the given
@@ -547,10 +549,10 @@ impl TypeEnv {
             filenames: defs.filenames.clone(),
             file_texts: defs.file_texts.clone(),
             syms: vec![],
-            sym_map: BTreeMap::new(),
+            sym_map: StableMap::new(),
             types: vec![],
-            type_map: BTreeMap::new(),
-            const_types: BTreeMap::new(),
+            type_map: StableMap::new(),
+            const_types: StableMap::new(),
             errors: vec![],
         };
 
@@ -725,9 +727,9 @@ impl TypeEnv {
                 self.filenames[pos.file].clone(),
                 self.file_texts[pos.file].clone(),
             ),
-            span: miette::SourceSpan::from((pos.offset, 1)),
+            span: Span::new_single(pos),
         };
-        log::trace!("{}", e);
+        log!("{}", e);
         e
     }
 
@@ -770,9 +772,9 @@ impl TermEnv {
     pub fn from_ast(tyenv: &mut TypeEnv, defs: &ast::Defs) -> Result<TermEnv> {
         let mut env = TermEnv {
             terms: vec![],
-            term_map: BTreeMap::new(),
+            term_map: StableMap::new(),
             rules: vec![],
-            converters: BTreeMap::new(),
+            converters: StableMap::new(),
         };
 
         env.collect_term_sigs(tyenv, defs);
@@ -902,7 +904,7 @@ impl TermEnv {
 
     fn collect_constructors(&mut self, tyenv: &mut TypeEnv, defs: &ast::Defs) {
         for def in &defs.defs {
-            log::debug!("collect_constructors from def: {:?}", def);
+            log!("collect_constructors from def: {:?}", def);
             match def {
                 &ast::Def::Rule(ref rule) => {
                     let pos = rule.pos;
@@ -982,7 +984,7 @@ impl TermEnv {
                 };
 
                 let template = ext.template.make_macro_template(&ext.args[..]);
-                log::trace!("extractor def: {:?} becomes template {:?}", def, template);
+                log!("extractor def: {:?} becomes template {:?}", def, template);
 
                 let mut callees = BTreeSet::new();
                 template.terms(&mut |pos, t| {
@@ -1040,7 +1042,7 @@ impl TermEnv {
         let mut stack = vec![];
         'outer: for root in extractor_call_graph.keys().copied() {
             stack.clear();
-            stack.push((root, vec![root], BTreeSet::new()));
+            stack.push((root, vec![root], StableSet::new()));
 
             while let Some((caller, path, mut seen)) = stack.pop() {
                 let is_new = seen.insert(caller);
@@ -1451,8 +1453,8 @@ impl TermEnv {
         bindings: &mut Bindings,
         is_root: bool,
     ) -> Option<(Pattern, TypeId)> {
-        log::trace!("translate_pattern: {:?}", pat);
-        log::trace!("translate_pattern: bindings = {:?}", bindings);
+        log!("translate_pattern: {:?}", pat);
+        log!("translate_pattern: bindings = {:?}", bindings);
         match pat {
             // TODO: flag on primitive type decl indicating it's an integer type?
             &ast::Pattern::ConstInt { val, pos } => {
@@ -1546,7 +1548,7 @@ impl TermEnv {
                 }
                 let id = VarId(bindings.next_var);
                 bindings.next_var += 1;
-                log::trace!("binding var {:?}", var.0);
+                log!("binding var {:?}", var.0);
                 bindings.vars.push(BoundVar { name, id, ty });
 
                 Some((Pattern::BindPattern(ty, id, Box::new(subpat)), ty))
@@ -1572,7 +1574,7 @@ impl TermEnv {
                         };
                         let id = VarId(bindings.next_var);
                         bindings.next_var += 1;
-                        log::trace!("binding var {:?}", var.0);
+                        log!("binding var {:?}", var.0);
                         bindings.vars.push(BoundVar { name, id, ty });
                         Some((
                             Pattern::BindPattern(ty, id, Box::new(Pattern::Wildcard(ty))),
@@ -1687,7 +1689,7 @@ impl TermEnv {
                         for template_arg in args {
                             macro_args.push(template_arg.clone());
                         }
-                        log::trace!("internal extractor macro args = {:?}", args);
+                        log!("internal extractor macro args = {:?}", args);
                         let pat = template.subst_macro_args(&macro_args[..])?;
                         return self.translate_pattern(
                             tyenv,
@@ -1767,7 +1769,7 @@ impl TermEnv {
         bindings: &mut Bindings,
         pure: bool,
     ) -> Option<Expr> {
-        log::trace!("translate_expr: {:?}", expr);
+        log!("translate_expr: {:?}", expr);
         match expr {
             &ast::Expr::Term {
                 ref sym,
@@ -1949,9 +1951,6 @@ impl TermEnv {
                 for def in defs {
                     // Check that the given variable name does not already exist.
                     let name = tyenv.intern_mut(&def.var);
-                    if bindings.vars.iter().any(|bv| bv.name == name) {
-                        tyenv.report_error(pos, format!("Variable '{}' already bound", def.var.0));
-                    }
 
                     // Look up the type.
                     let tysym = match tyenv.intern(&def.ty) {

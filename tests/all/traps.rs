@@ -30,7 +30,6 @@ fn test_trap_return() -> Result<()> {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), ignore)] // TODO #2808 system libunwind is broken on aarch64
 fn test_trap_trace() -> Result<()> {
     let mut store = Store::<()>::default();
     let wat = r#"
@@ -49,7 +48,7 @@ fn test_trap_trace() -> Result<()> {
         .err()
         .expect("error calling function");
 
-    let trace = e.trace();
+    let trace = e.trace().expect("backtrace is available");
     assert_eq!(trace.len(), 2);
     assert_eq!(trace[0].module_name().unwrap(), "hello_mod");
     assert_eq!(trace[0].func_index(), 1);
@@ -71,7 +70,33 @@ fn test_trap_trace() -> Result<()> {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), ignore)] // TODO #2808 system libunwind is broken on aarch64
+#[allow(deprecated)]
+fn test_trap_backtrace_disabled() -> Result<()> {
+    let mut config = Config::default();
+    config.wasm_backtrace(false);
+    let engine = Engine::new(&config).unwrap();
+    let mut store = Store::<()>::new(&engine, ());
+    let wat = r#"
+        (module $hello_mod
+            (func (export "run") (call $hello))
+            (func $hello (unreachable))
+        )
+    "#;
+
+    let module = Module::new(store.engine(), wat)?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let run_func = instance.get_typed_func::<(), (), _>(&mut store, "run")?;
+
+    let e = run_func
+        .call(&mut store, ())
+        .err()
+        .expect("error calling function");
+
+    assert!(e.trace().is_none(), "backtraces should be disabled");
+    Ok(())
+}
+
+#[test]
 fn test_trap_trace_cb() -> Result<()> {
     let mut store = Store::<()>::default();
     let wat = r#"
@@ -94,7 +119,7 @@ fn test_trap_trace_cb() -> Result<()> {
         .err()
         .expect("error calling function");
 
-    let trace = e.trace();
+    let trace = e.trace().expect("backtrace is available");
     assert_eq!(trace.len(), 2);
     assert_eq!(trace[0].module_name().unwrap(), "hello_mod");
     assert_eq!(trace[0].func_index(), 2);
@@ -106,7 +131,6 @@ fn test_trap_trace_cb() -> Result<()> {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), ignore)] // TODO #2808 system libunwind is broken on aarch64
 fn test_trap_stack_overflow() -> Result<()> {
     let mut store = Store::<()>::default();
     let wat = r#"
@@ -124,7 +148,7 @@ fn test_trap_stack_overflow() -> Result<()> {
         .err()
         .expect("error calling function");
 
-    let trace = e.trace();
+    let trace = e.trace().expect("backtrace is available");
     assert!(trace.len() >= 32);
     for i in 0..trace.len() {
         assert_eq!(trace[i].module_name().unwrap(), "rec_mod");
@@ -137,7 +161,6 @@ fn test_trap_stack_overflow() -> Result<()> {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), ignore)] // TODO #2808 system libunwind is broken on aarch64
 fn trap_display_pretty() -> Result<()> {
     let mut store = Store::<()>::default();
     let wat = r#"
@@ -172,7 +195,6 @@ wasm backtrace:
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), ignore)] // TODO #2808 system libunwind is broken on aarch64
 fn trap_display_multi_module() -> Result<()> {
     let mut store = Store::<()>::default();
     let wat = r#"
@@ -281,6 +303,61 @@ fn rust_panic_import() -> Result<()> {
     Ok(())
 }
 
+// Test that we properly save/restore our trampolines' saved Wasm registers
+// (used when capturing backtraces) before we resume panics.
+#[test]
+fn rust_catch_panic_import() -> Result<()> {
+    let mut store = Store::<()>::default();
+
+    let binary = wat::parse_str(
+        r#"
+            (module $a
+                (import "" "panic" (func $panic))
+                (import "" "catch panic" (func $catch_panic))
+                (func (export "panic") call $panic)
+                (func (export "run")
+                  call $catch_panic
+                  call $catch_panic
+                  unreachable
+                )
+            )
+        "#,
+    )?;
+
+    let module = Module::new(store.engine(), &binary)?;
+    let num_panics = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let sig = FuncType::new(None, None);
+    let panic = Func::new(&mut store, sig, {
+        let num_panics = num_panics.clone();
+        move |_, _, _| {
+            num_panics.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("this is a panic");
+        }
+    });
+    let catch_panic = Func::wrap(&mut store, |mut caller: Caller<'_, _>| {
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            drop(
+                caller
+                    .get_export("panic")
+                    .unwrap()
+                    .into_func()
+                    .unwrap()
+                    .call(&mut caller, &[], &mut []),
+            );
+        }))
+        .unwrap_err();
+    });
+
+    let instance = Instance::new(&mut store, &module, &[panic.into(), catch_panic.into()])?;
+    let run = instance.get_typed_func::<(), (), _>(&mut store, "run")?;
+    let trap = run.call(&mut store, ()).unwrap_err();
+    let trace = trap.trace().unwrap();
+    assert_eq!(trace.len(), 1);
+    assert_eq!(trace[0].func_index(), 3);
+    assert_eq!(num_panics.load(std::sync::atomic::Ordering::SeqCst), 2);
+    Ok(())
+}
+
 #[test]
 fn rust_panic_start_function() -> Result<()> {
     let mut store = Store::<()>::default();
@@ -378,7 +455,6 @@ fn call_signature_mismatch() -> Result<()> {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), ignore)] // TODO #2808 system libunwind is broken on aarch64
 fn start_trap_pretty() -> Result<()> {
     let mut store = Store::<()>::default();
     let wat = r#"
@@ -412,7 +488,6 @@ wasm backtrace:
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), ignore)] // TODO #2808 system libunwind is broken on aarch64
 fn present_after_module_drop() -> Result<()> {
     let mut store = Store::<()>::default();
     let module = Module::new(store.engine(), r#"(func (export "foo") unreachable)"#)?;
@@ -429,8 +504,9 @@ fn present_after_module_drop() -> Result<()> {
 
     fn assert_trap(t: Trap) {
         println!("{}", t);
-        assert_eq!(t.trace().len(), 1);
-        assert_eq!(t.trace()[0].func_index(), 0);
+        let trace = t.trace().expect("backtrace is available");
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0].func_index(), 0);
     }
 }
 
@@ -496,7 +572,6 @@ fn rustc(src: &str) -> Vec<u8> {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), ignore)] // TODO #2808 system libunwind is broken on aarch64
 fn parse_dwarf_info() -> Result<()> {
     let wasm = rustc(
         "
@@ -525,7 +600,7 @@ fn parse_dwarf_info() -> Result<()> {
         .downcast::<Trap>()?;
 
     let mut found = false;
-    for frame in trap.trace() {
+    for frame in trap.trace().expect("backtrace is available") {
         for symbol in frame.symbols() {
             if let Some(file) = symbol.file() {
                 if file.ends_with("input.rs") {
@@ -541,7 +616,6 @@ fn parse_dwarf_info() -> Result<()> {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), ignore)] // TODO #2808 system libunwind is broken on aarch64
 fn no_hint_even_with_dwarf_info() -> Result<()> {
     let mut config = Config::new();
     config.wasm_backtrace_details(WasmBacktraceDetails::Disable);
@@ -574,7 +648,6 @@ wasm backtrace:
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), ignore)] // TODO #2808 system libunwind is broken on aarch64
 fn hint_with_dwarf_info() -> Result<()> {
     // Skip this test if the env var is already configure, but in CI we're sure
     // to run tests without this env var configured.
@@ -639,7 +712,6 @@ fn multithreaded_traps() -> Result<()> {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), ignore)] // TODO #2808 system libunwind is broken on aarch64
 fn traps_without_address_map() -> Result<()> {
     let mut config = Config::new();
     config.generate_address_map(false);
@@ -661,7 +733,7 @@ fn traps_without_address_map() -> Result<()> {
         .err()
         .expect("error calling function");
 
-    let trace = e.trace();
+    let trace = e.trace().expect("backtrace is available");
     assert_eq!(trace.len(), 2);
     assert_eq!(trace[0].func_name(), Some("hello"));
     assert_eq!(trace[0].func_index(), 1);

@@ -17,9 +17,21 @@ fn run(data: &[u8]) -> Result<()> {
     config.set_differential_config();
 
     // Enable features that v8 has implemented
-    config.module_config.config.simd_enabled = true;
-    config.module_config.config.bulk_memory_enabled = true;
-    config.module_config.config.reference_types_enabled = true;
+    config.module_config.config.simd_enabled = u.arbitrary()?;
+    config.module_config.config.bulk_memory_enabled = u.arbitrary()?;
+
+    // FIXME: reference types are disabled for now as we seemingly keep finding
+    // a segfault in v8. This is found relatively quickly locally and keeps
+    // getting found by oss-fuzz and currently we don't think that there's
+    // really much we can do about it. For the time being disable reference
+    // types entirely. An example bug is
+    // https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=45662
+    //
+    // config.module_config.config.reference_types_enabled = u.arbitrary()?;
+
+    // FIXME: to enable fuzzing with the threads proposal, see
+    // https://github.com/bytecodealliance/wasmtime/issues/4268.
+    // config.module_config.config.threads_enabled = u.arbitrary()?;
 
     // Allow multiple tables, as set_differential_config() assumes reference
     // types are disabled and therefore sets max_tables to 1

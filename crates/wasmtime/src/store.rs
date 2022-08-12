@@ -202,6 +202,7 @@ pub struct StoreInner<T> {
 
     limiter: Option<ResourceLimiterInner<T>>,
     call_hook: Option<CallHookInner<T>>,
+    epoch_deadline_behavior: EpochDeadline<T>,
     // for comments about `ManuallyDrop`, see `Store::into_data`
     data: ManuallyDrop<T>,
 }
@@ -296,7 +297,6 @@ pub struct StoreOpaque {
     #[cfg(feature = "async")]
     async_state: AsyncState,
     out_of_gas_behavior: OutOfGas,
-    epoch_deadline_behavior: EpochDeadline,
     /// Indexed data within this `Store`, used to store information about
     /// globals, functions, memories, etc.
     ///
@@ -304,7 +304,7 @@ pub struct StoreOpaque {
     /// `rooted_host_funcs` below. This structure contains pointers which are
     /// otherwise kept alive by the `Arc` references in `rooted_host_funcs`.
     store_data: ManuallyDrop<StoreData>,
-    default_callee: InstanceHandle,
+    default_caller: InstanceHandle,
 
     /// Used to optimzed wasm->host calls when the host function is defined with
     /// `Func::new` to avoid allocating a new vector each time a function is
@@ -426,10 +426,11 @@ enum OutOfGas {
 
 /// What to do when the engine epoch reaches the deadline for a Store
 /// during execution of a function using that store.
-#[derive(Copy, Clone)]
-enum EpochDeadline {
+enum EpochDeadline<T> {
     /// Return early with a trap.
     Trap,
+    /// Call a custom deadline handler.
+    Callback(Box<dyn FnMut(&mut T) -> Result<u64> + Send + Sync>),
     /// Extend the deadline by the specified number of ticks after
     /// yielding to the async executor loop.
     #[cfg(feature = "async")]
@@ -491,15 +492,15 @@ impl<T> Store<T> {
                     current_poll_cx: UnsafeCell::new(ptr::null_mut()),
                 },
                 out_of_gas_behavior: OutOfGas::Trap,
-                epoch_deadline_behavior: EpochDeadline::Trap,
                 store_data: ManuallyDrop::new(StoreData::new()),
-                default_callee,
+                default_caller: default_callee,
                 hostcall_val_storage: Vec::new(),
                 wasm_val_raw_storage: Vec::new(),
                 rooted_host_funcs: ManuallyDrop::new(Vec::new()),
             },
             limiter: None,
             call_hook: None,
+            epoch_deadline_behavior: EpochDeadline::Trap,
             data: ManuallyDrop::new(data),
         });
 
@@ -513,7 +514,7 @@ impl<T> Store<T> {
                 *mut (dyn wasmtime_runtime::Store + '_),
                 *mut (dyn wasmtime_runtime::Store + 'static),
             >(&mut *inner);
-            inner.default_callee.set_store(traitobj);
+            inner.default_caller.set_store(traitobj);
         }
 
         Self {
@@ -566,12 +567,57 @@ impl<T> Store<T> {
         }
     }
 
-    /// Configures the [`ResourceLimiter`](crate::ResourceLimiter) used to limit
-    /// resource creation within this [`Store`].
+    /// Configures the [`ResourceLimiter`] used to limit resource creation
+    /// within this [`Store`].
+    ///
+    /// Whenever resources such as linear memory, tables, or instances are
+    /// allocated the `limiter` specified here is invoked with the store's data
+    /// `T` and the returned [`ResourceLimiter`] is used to limit the operation
+    /// being allocated. The returned [`ResourceLimiter`] is intended to live
+    /// within the `T` itself, for example by storing a
+    /// [`StoreLimits`](crate::StoreLimits).
     ///
     /// Note that this limiter is only used to limit the creation/growth of
     /// resources in the future, this does not retroactively attempt to apply
     /// limits to the [`Store`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wasmtime::*;
+    ///
+    /// struct MyApplicationState {
+    ///     my_state: u32,
+    ///     limits: StoreLimits,
+    /// }
+    ///
+    /// let engine = Engine::default();
+    /// let my_state = MyApplicationState {
+    ///     my_state: 42,
+    ///     limits: StoreLimitsBuilder::new()
+    ///         .memory_size(1 << 20 /* 1 MB */)
+    ///         .instances(2)
+    ///         .build(),
+    /// };
+    /// let mut store = Store::new(&engine, my_state);
+    /// store.limiter(|state| &mut state.limits);
+    ///
+    /// // Creation of smaller memories is allowed
+    /// Memory::new(&mut store, MemoryType::new(1, None)).unwrap();
+    ///
+    /// // Creation of a larger memory, however, will exceed the 1MB limit we've
+    /// // configured
+    /// assert!(Memory::new(&mut store, MemoryType::new(1000, None)).is_err());
+    ///
+    /// // The number of instances in this store is limited to 2, so the third
+    /// // instance here should fail.
+    /// let module = Module::new(&engine, "(module)").unwrap();
+    /// assert!(Instance::new(&mut store, &module, &[]).is_ok());
+    /// assert!(Instance::new(&mut store, &module, &[]).is_ok());
+    /// assert!(Instance::new(&mut store, &module, &[]).is_err());
+    /// ```
+    ///
+    /// [`ResourceLimiter`]: crate::ResourceLimiter
     pub fn limiter(
         &mut self,
         mut limiter: impl FnMut(&mut T) -> &mut (dyn crate::ResourceLimiter) + Send + Sync + 'static,
@@ -591,20 +637,12 @@ impl<T> Store<T> {
         inner.limiter = Some(ResourceLimiterInner::Sync(Box::new(limiter)));
     }
 
-    #[cfg_attr(nightlydoc, doc(cfg(feature = "async")))]
     /// Configures the [`ResourceLimiterAsync`](crate::ResourceLimiterAsync)
-    /// used to limit resource creation within this [`Store`]. Must be used
-    /// with an async `Store`!.
+    /// used to limit resource creation within this [`Store`].
     ///
-    /// Note that this limiter is only used to limit the creation/growth of
-    /// resources in the future, this does not retroactively attempt to apply
-    /// limits to the [`Store`].
-    ///
-    /// This variation on the [`ResourceLimiter`](`crate::ResourceLimiter`)
-    /// makes the `memory_growing` and `table_growing` functions `async`. This
-    /// means that, as part of your resource limiting strategy, the async
-    /// resource limiter may yield execution until a resource becomes
-    /// available.
+    /// This method is an asynchronous variant of the [`Store::limiter`] method
+    /// where the embedder can block the wasm request for more resources with
+    /// host `async` execution of futures.
     ///
     /// By using a [`ResourceLimiterAsync`](`crate::ResourceLimiterAsync`)
     /// with a [`Store`], you can no longer use
@@ -616,7 +654,14 @@ impl<T> Store<T> {
     /// [`Memory::grow_async`](`crate::Memory::grow_async`),
     /// [`Table::new_async`](`crate::Table::new_async`), and
     /// [`Table::grow_async`](`crate::Table::grow_async`).
+    ///
+    /// Note that this limiter is only used to limit the creation/growth of
+    /// resources in the future, this does not retroactively attempt to apply
+    /// limits to the [`Store`]. Additionally this must be used with an async
+    /// [`Store`] configured via
+    /// [`Config::async_support`](crate::Config::async_support).
     #[cfg(feature = "async")]
+    #[cfg_attr(nightlydoc, doc(cfg(feature = "async")))]
     pub fn limiter_async(
         &mut self,
         mut limiter: impl FnMut(&mut T) -> &mut (dyn crate::ResourceLimiterAsync)
@@ -825,6 +870,10 @@ impl<T> Store<T> {
     /// [`Engine::increment_epoch()`] has been invoked at least
     /// `ticks_beyond_current` times.
     ///
+    /// By default a store will trap immediately with an epoch deadline of 0
+    /// (which has always "elapsed"). This method is required to be configured
+    /// for stores with epochs enabled to some future epoch deadline.
+    ///
     /// See documentation on
     /// [`Config::epoch_interruption()`](crate::Config::epoch_interruption)
     /// for an introduction to epoch-based interruption.
@@ -842,8 +891,37 @@ impl<T> Store<T> {
     ///
     /// This behavior is the default if the store is not otherwise
     /// configured via
-    /// [`epoch_deadline_trap()`](Store::epoch_deadline_trap) or
+    /// [`epoch_deadline_trap()`](Store::epoch_deadline_trap),
+    /// [`epoch_deadline_callback()`](Store::epoch_deadline_callback) or
     /// [`epoch_deadline_async_yield_and_update()`](Store::epoch_deadline_async_yield_and_update).
+    ///
+    /// This setting is intended to allow for coarse-grained
+    /// interruption, but not a deterministic deadline of a fixed,
+    /// finite interval. For deterministic interruption, see the
+    /// "fuel" mechanism instead.
+    ///
+    /// Note that when this is used it's required to call
+    /// [`Store::set_epoch_deadline`] or otherwise wasm will always immediately
+    /// trap.
+    ///
+    /// See documentation on
+    /// [`Config::epoch_interruption()`](crate::Config::epoch_interruption)
+    /// for an introduction to epoch-based interruption.
+    pub fn epoch_deadline_trap(&mut self) {
+        self.inner.epoch_deadline_trap();
+    }
+
+    /// Configures epoch-deadline expiration to invoke a custom callback
+    /// function.
+    ///
+    /// When epoch-interruption-instrumented code is executed on this
+    /// store and the epoch deadline is reached before completion, the
+    /// provided callback function is invoked.
+    ///
+    /// This function should return a positive `delta`, which is used to
+    /// update the new epoch, setting it to the current epoch plus
+    /// `delta` ticks. Alternatively, the callback may return an error,
+    /// which will terminate execution.
     ///
     /// This setting is intended to allow for coarse-grained
     /// interruption, but not a deterministic deadline of a fixed,
@@ -853,8 +931,11 @@ impl<T> Store<T> {
     /// See documentation on
     /// [`Config::epoch_interruption()`](crate::Config::epoch_interruption)
     /// for an introduction to epoch-based interruption.
-    pub fn epoch_deadline_trap(&mut self) {
-        self.inner.epoch_deadline_trap();
+    pub fn epoch_deadline_callback(
+        &mut self,
+        callback: impl FnMut(&mut T) -> Result<u64> + Send + Sync + 'static,
+    ) {
+        self.inner.epoch_deadline_callback(Box::new(callback));
     }
 
     #[cfg_attr(nightlydoc, doc(cfg(feature = "async")))]
@@ -1031,7 +1112,12 @@ impl<T> StoreInner<T> {
     }
 }
 
+#[doc(hidden)]
 impl StoreOpaque {
+    pub fn id(&self) -> StoreId {
+        self.store_data.id()
+    }
+
     pub fn bump_resource_counts(&mut self, module: &Module) -> Result<()> {
         fn bump(slot: &mut usize, max: usize, amt: usize, desc: &str) -> Result<()> {
             let new = slot.saturating_add(amt);
@@ -1080,6 +1166,11 @@ impl StoreOpaque {
     #[inline]
     pub fn store_data_mut(&mut self) -> &mut StoreData {
         &mut self.store_data
+    }
+
+    #[inline]
+    pub(crate) fn modules(&self) -> &ModuleRegistry {
+        &self.modules
     }
 
     #[inline]
@@ -1351,22 +1442,6 @@ impl StoreOpaque {
         }
     }
 
-    fn epoch_deadline_trap(&mut self) {
-        self.epoch_deadline_behavior = EpochDeadline::Trap;
-    }
-
-    fn epoch_deadline_async_yield_and_update(&mut self, delta: u64) {
-        assert!(
-            self.async_support(),
-            "cannot use `epoch_deadline_async_yield_and_update` without enabling async support in the config"
-        );
-        #[cfg(feature = "async")]
-        {
-            self.epoch_deadline_behavior = EpochDeadline::YieldAndExtendDeadline { delta };
-        }
-        drop(delta); // suppress warning in non-async build
-    }
-
     #[inline]
     pub fn signal_handler(&self) -> Option<*const SignalHandler<'static>> {
         let handler = self.signal_handler.as_ref()?;
@@ -1383,12 +1458,12 @@ impl StoreOpaque {
     }
 
     #[inline]
-    pub fn default_callee(&self) -> *mut VMContext {
-        self.default_callee.vmctx_ptr()
+    pub fn default_caller(&self) -> *mut VMContext {
+        self.default_caller.vmctx_ptr()
     }
 
     pub fn traitobj(&self) -> *mut dyn wasmtime_runtime::Store {
-        self.default_callee.store()
+        self.default_caller.store()
     }
 
     /// Takes the cached `Vec<Val>` stored internally across hostcalls to get
@@ -1706,9 +1781,9 @@ impl AsyncCx {
                 Poll::Pending => {}
             }
 
-            let before = wasmtime_runtime::TlsRestore::take().map_err(Trap::from_runtime_box)?;
+            let before = wasmtime_runtime::TlsRestore::take();
             let res = (*suspend).suspend(());
-            before.replace().map_err(Trap::from_runtime_box)?;
+            before.replace();
             res?;
         }
     }
@@ -1855,10 +1930,21 @@ unsafe impl<T> wasmtime_runtime::Store for StoreInner<T> {
     }
 
     fn new_epoch(&mut self) -> Result<u64, anyhow::Error> {
-        return match &self.epoch_deadline_behavior {
-            &EpochDeadline::Trap => Err(anyhow::Error::new(EpochDeadlineError)),
+        return match &mut self.epoch_deadline_behavior {
+            EpochDeadline::Trap => {
+                let trap = Trap::new_wasm(wasmtime_environ::TrapCode::Interrupt, None);
+                Err(anyhow::Error::from(trap))
+            }
+            EpochDeadline::Callback(callback) => {
+                let delta = callback(&mut self.data)?;
+                // Set a new deadline and return the new epoch deadline so
+                // the Wasm code doesn't have to reload it.
+                self.set_epoch_deadline(delta);
+                Ok(self.get_epoch_deadline())
+            }
             #[cfg(feature = "async")]
-            &EpochDeadline::YieldAndExtendDeadline { delta } => {
+            EpochDeadline::YieldAndExtendDeadline { delta } => {
+                let delta = *delta;
                 // Do the async yield. May return a trap if future was
                 // canceled while we're yielded.
                 self.async_yield_impl()?;
@@ -1870,17 +1956,6 @@ unsafe impl<T> wasmtime_runtime::Store for StoreInner<T> {
                 Ok(self.get_epoch_deadline())
             }
         };
-
-        #[derive(Debug)]
-        struct EpochDeadlineError;
-
-        impl fmt::Display for EpochDeadlineError {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("epoch deadline reached during execution")
-            }
-        }
-
-        impl std::error::Error for EpochDeadlineError {}
     }
 }
 
@@ -1897,6 +1972,29 @@ impl<T> StoreInner<T> {
         // return into it.
         let epoch_deadline = unsafe { (*self.vmruntime_limits()).epoch_deadline.get_mut() };
         *epoch_deadline = self.engine().current_epoch() + delta;
+    }
+
+    fn epoch_deadline_trap(&mut self) {
+        self.epoch_deadline_behavior = EpochDeadline::Trap;
+    }
+
+    fn epoch_deadline_callback(
+        &mut self,
+        callback: Box<dyn FnMut(&mut T) -> Result<u64> + Send + Sync>,
+    ) {
+        self.epoch_deadline_behavior = EpochDeadline::Callback(callback);
+    }
+
+    fn epoch_deadline_async_yield_and_update(&mut self, delta: u64) {
+        assert!(
+            self.async_support(),
+            "cannot use `epoch_deadline_async_yield_and_update` without enabling async support in the config"
+        );
+        #[cfg(feature = "async")]
+        {
+            self.epoch_deadline_behavior = EpochDeadline::YieldAndExtendDeadline { delta };
+        }
+        drop(delta); // suppress warning in non-async build
     }
 
     fn get_epoch_deadline(&self) -> u64 {
@@ -1949,7 +2047,7 @@ impl Drop for StoreOpaque {
                     allocator.deallocate(&instance.handle);
                 }
             }
-            ondemand.deallocate(&self.default_callee);
+            ondemand.deallocate(&self.default_caller);
 
             // See documentation for these fields on `StoreOpaque` for why they
             // must be dropped in this order.

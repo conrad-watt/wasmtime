@@ -7,13 +7,11 @@
 //! assert_eq!(results, &[Value::I32(43)]);
 //! ```
 use crate::Value;
-use lazy_static::lazy_static;
 use ocaml_interop::{OCamlRuntime, ToOCaml};
+use once_cell::sync::Lazy;
 use std::sync::Mutex;
 
-lazy_static! {
-    static ref INTERPRET: Mutex<()> = Mutex::new(());
-}
+static INTERPRET: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 /// Interpret the first function in the passed WebAssembly module (in Wasm form,
 /// currently, not WAT), optionally with the given parameters. If no parameters
@@ -120,5 +118,16 @@ mod tests {
                 255, 0, 255, 255, 0, 255, 255, 255, 255, 0, 255, 255, 255, 255, 255, 255
             ])]
         );
+    }
+
+    // See issue https://github.com/bytecodealliance/wasmtime/issues/4671.
+    #[test]
+    fn order_of_params() {
+        let module = wat::parse_file("tests/shr_s.wat").unwrap();
+
+        let parameters = Some(vec![Value::I32(1795123818), Value::I32(-2147483648)]);
+        let results = interpret(&module, parameters.clone()).unwrap();
+
+        assert_eq!(results, vec![Value::I32(1795123818)]);
     }
 }

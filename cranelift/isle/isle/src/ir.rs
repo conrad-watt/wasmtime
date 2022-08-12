@@ -1,8 +1,9 @@
 //! Lowered matching IR.
 
 use crate::lexer::Pos;
+use crate::log;
 use crate::sema::*;
-use std::collections::BTreeMap;
+use crate::StableMap;
 
 declare_id!(
     /// The id of an instruction in a `PatternSequence`.
@@ -48,7 +49,7 @@ pub enum PatternInst {
         /// The value's type.
         ty: TypeId,
         /// The integer to match against the value.
-        int_val: i64,
+        int_val: i128,
     },
 
     /// Try matching the given value as the given constant. Produces no values.
@@ -93,6 +94,9 @@ pub enum PatternInst {
     /// value to extract, the other are the `Input`-polarity extractor args) and
     /// producing an output value for each `Output`-polarity extractor arg.
     Extract {
+        /// Whether this extraction is infallible or not. `false`
+        /// comes before `true`, so fallible nodes come first.
+        infallible: bool,
         /// The value to extract, followed by polarity extractor args.
         inputs: Vec<Value>,
         /// The types of the inputs.
@@ -101,8 +105,6 @@ pub enum PatternInst {
         output_tys: Vec<TypeId>,
         /// This extractor's term.
         term: TermId,
-        /// Whether this extraction is infallible or not.
-        infallible: bool,
     },
 
     // NB: This has to go last, since it is infallible, so that when we sort
@@ -127,7 +129,7 @@ pub enum ExprInst {
         /// This integer type.
         ty: TypeId,
         /// The integer value. Must fit within the type.
-        val: i64,
+        val: i128,
     },
 
     /// Produce a constant extern value.
@@ -221,7 +223,7 @@ impl ExprSequence {
     /// Is this expression sequence producing a constant integer?
     ///
     /// If so, return the integer type and the constant.
-    pub fn is_const_int(&self) -> Option<(TypeId, i64)> {
+    pub fn is_const_int(&self) -> Option<(TypeId, i128)> {
         if self.insts.len() == 2 && matches!(&self.insts[1], &ExprInst::Return { .. }) {
             match &self.insts[0] {
                 &ExprInst::ConstInt { ty, val } => Some((ty, val)),
@@ -265,7 +267,7 @@ impl PatternSequence {
         self.add_inst(PatternInst::MatchEqual { a, b, ty });
     }
 
-    fn add_match_int(&mut self, input: Value, ty: TypeId, int_val: i64) {
+    fn add_match_int(&mut self, input: Value, ty: TypeId, int_val: i128) {
         self.add_inst(PatternInst::MatchInt { input, ty, int_val });
     }
 
@@ -340,7 +342,7 @@ impl PatternSequence {
         typeenv: &TypeEnv,
         termenv: &TermEnv,
         pat: &Pattern,
-        vars: &mut BTreeMap<VarId, Value>,
+        vars: &mut StableMap<VarId, Value>,
     ) {
         match pat {
             &Pattern::BindPattern(_ty, var, ref subpat) => {
@@ -485,7 +487,7 @@ impl ExprSequence {
         id
     }
 
-    fn add_const_int(&mut self, ty: TypeId, val: i64) -> Value {
+    fn add_const_int(&mut self, ty: TypeId, val: i128) -> Value {
         let inst = InstId(self.insts.len());
         self.add_inst(ExprInst::ConstInt { ty, val });
         Value::Expr { inst, output: 0 }
@@ -547,9 +549,9 @@ impl ExprSequence {
         typeenv: &TypeEnv,
         termenv: &TermEnv,
         expr: &Expr,
-        vars: &BTreeMap<VarId, Value>,
+        vars: &StableMap<VarId, Value>,
     ) -> Value {
-        log::trace!("gen_expr: expr {:?}", expr);
+        log!("gen_expr: expr {:?}", expr);
         match expr {
             &Expr::ConstInt(ty, val) => self.add_const_int(ty, val),
             &Expr::ConstPrim(ty, val) => self.add_const_prim(ty, val),
@@ -621,13 +623,13 @@ pub fn lower_rule(
     expr_seq.pos = termenv.rules[rule.index()].pos;
 
     let ruledata = &termenv.rules[rule.index()];
-    let mut vars = BTreeMap::new();
+    let mut vars = StableMap::new();
     let root_term = ruledata
         .lhs
         .root_term()
         .expect("Pattern must have a term at the root");
 
-    log::trace!("lower_rule: ruledata {:?}", ruledata,);
+    log!("lower_rule: ruledata {:?}", ruledata,);
 
     // Lower the pattern, starting from the root input value.
     pattern_seq.gen_pattern(

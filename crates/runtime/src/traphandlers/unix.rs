@@ -1,4 +1,4 @@
-use crate::traphandlers::{tls, wasmtime_longjmp, Trap};
+use crate::traphandlers::{tls, wasmtime_longjmp};
 use std::cell::RefCell;
 use std::io;
 use std::mem::{self, MaybeUninit};
@@ -86,7 +86,7 @@ unsafe extern "C" fn trap_handler(
         // Otherwise flag ourselves as handling a trap, do the trap
         // handling, and reset our trap handling flag. Then we figure
         // out what to do based on the result of the trap handling.
-        let pc = get_pc(context, signum);
+        let (pc, fp) = get_pc_and_fp(context, signum);
         let jmp_buf = info.jmp_buf_if_trap(pc, |handler| handler(signum, siginfo, context));
 
         // Figure out what to do based on the result of this handling of
@@ -99,7 +99,7 @@ unsafe extern "C" fn trap_handler(
         if jmp_buf as usize == 1 {
             return true;
         }
-        info.capture_backtrace(pc);
+        info.set_jit_trap(pc, fp);
         // On macOS this is a bit special, unfortunately. If we were to
         // `siglongjmp` out of the signal handler that notably does
         // *not* reset the sigaltstack state of our signal handler. This
@@ -164,17 +164,26 @@ unsafe extern "C" fn trap_handler(
     }
 }
 
-unsafe fn get_pc(cx: *mut libc::c_void, _signum: libc::c_int) -> *const u8 {
+unsafe fn get_pc_and_fp(cx: *mut libc::c_void, _signum: libc::c_int) -> (*const u8, usize) {
     cfg_if::cfg_if! {
         if #[cfg(all(target_os = "linux", target_arch = "x86_64"))] {
             let cx = &*(cx as *const libc::ucontext_t);
-            cx.uc_mcontext.gregs[libc::REG_RIP as usize] as *const u8
+            (
+                cx.uc_mcontext.gregs[libc::REG_RIP as usize] as *const u8,
+                cx.uc_mcontext.gregs[libc::REG_RBP as usize] as usize
+            )
         } else if #[cfg(all(target_os = "linux", target_arch = "x86"))] {
             let cx = &*(cx as *const libc::ucontext_t);
-            cx.uc_mcontext.gregs[libc::REG_EIP as usize] as *const u8
+            (
+                cx.uc_mcontext.gregs[libc::REG_EIP as usize] as *const u8,
+                cx.uc_mcontext.gregs[libc::REG_EBP as usize] as usize,
+            )
         } else if #[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))] {
             let cx = &*(cx as *const libc::ucontext_t);
-            cx.uc_mcontext.pc as *const u8
+            (
+                cx.uc_mcontext.pc as *const u8,
+                cx.uc_mcontext.regs[29] as usize,
+            )
         } else if #[cfg(all(target_os = "linux", target_arch = "s390x"))] {
             // On s390x, SIGILL and SIGFPE are delivered with the PSW address
             // pointing *after* the faulting instruction, while SIGSEGV and
@@ -191,19 +200,34 @@ unsafe fn get_pc(cx: *mut libc::c_void, _signum: libc::c_int) -> *const u8 {
                 _ => 0,
             };
             let cx = &*(cx as *const libc::ucontext_t);
-            (cx.uc_mcontext.psw.addr - trap_offset) as *const u8
+            (
+                (cx.uc_mcontext.psw.addr - trap_offset) as *const u8,
+                *(cx.uc_mcontext.gregs[15] as *const usize),
+            )
         } else if #[cfg(all(target_os = "macos", target_arch = "x86_64"))] {
             let cx = &*(cx as *const libc::ucontext_t);
-            (*cx.uc_mcontext).__ss.__rip as *const u8
+            (
+                (*cx.uc_mcontext).__ss.__rip as *const u8,
+                (*cx.uc_mcontext).__ss.__rbp as usize,
+            )
         } else if #[cfg(all(target_os = "macos", target_arch = "x86"))] {
             let cx = &*(cx as *const libc::ucontext_t);
-            (*cx.uc_mcontext).__ss.__eip as *const u8
+            (
+                (*cx.uc_mcontext).__ss.__eip as *const u8,
+                (*cx.uc_mcontext).__ss.__ebp as usize,
+            )
         } else if #[cfg(all(target_os = "macos", target_arch = "aarch64"))] {
             let cx = &*(cx as *const libc::ucontext_t);
-            (*cx.uc_mcontext).__ss.__pc as *const u8
+            (
+                (*cx.uc_mcontext).__ss.__pc as *const u8,
+                (*cx.uc_mcontext).__ss.__fp as usize,
+            )
         } else if #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))] {
             let cx = &*(cx as *const libc::ucontext_t);
-            cx.uc_mcontext.mc_rip as *const u8
+            (
+                cx.uc_mcontext.mc_rip as *const u8,
+                cx.uc_mcontext.mc_rbp as usize,
+            )
         } else {
             compile_error!("unsupported platform");
         }
@@ -252,7 +276,7 @@ unsafe fn set_pc(cx: *mut libc::c_void, pc: usize, arg1: usize) {
 /// and registering our own alternate stack that is large enough and has a guard
 /// page.
 #[cold]
-pub fn lazy_per_thread_init() -> Result<(), Box<Trap>> {
+pub fn lazy_per_thread_init() {
     // This thread local is purely used to register a `Stack` to get deallocated
     // when the thread exists. Otherwise this function is only ever called at
     // most once per-thread.
@@ -270,11 +294,10 @@ pub fn lazy_per_thread_init() -> Result<(), Box<Trap>> {
     }
 
     return STACK.with(|s| {
-        *s.borrow_mut() = unsafe { allocate_sigaltstack()? };
-        Ok(())
+        *s.borrow_mut() = unsafe { allocate_sigaltstack() };
     });
 
-    unsafe fn allocate_sigaltstack() -> Result<Option<Stack>, Box<Trap>> {
+    unsafe fn allocate_sigaltstack() -> Option<Stack> {
         // Check to see if the existing sigaltstack, if it exists, is big
         // enough. If so we don't need to allocate our own.
         let mut old_stack = mem::zeroed();
@@ -286,30 +309,30 @@ pub fn lazy_per_thread_init() -> Result<(), Box<Trap>> {
             io::Error::last_os_error()
         );
         if old_stack.ss_flags & libc::SS_DISABLE == 0 && old_stack.ss_size >= MIN_STACK_SIZE {
-            return Ok(None);
+            return None;
         }
 
         // ... but failing that we need to allocate our own, so do all that
         // here.
-        let page_size: usize = region::page::size();
+        let page_size = crate::page_size();
         let guard_size = page_size;
         let alloc_size = guard_size + MIN_STACK_SIZE;
 
-        let ptr = rustix::io::mmap_anonymous(
+        let ptr = rustix::mm::mmap_anonymous(
             null_mut(),
             alloc_size,
-            rustix::io::ProtFlags::empty(),
-            rustix::io::MapFlags::PRIVATE,
+            rustix::mm::ProtFlags::empty(),
+            rustix::mm::MapFlags::PRIVATE,
         )
-        .map_err(|_| Box::new(Trap::oom()))?;
+        .expect("failed to allocate memory for sigaltstack");
 
         // Prepare the stack with readable/writable memory and then register it
         // with `sigaltstack`.
         let stack_ptr = (ptr as usize + guard_size) as *mut std::ffi::c_void;
-        rustix::io::mprotect(
+        rustix::mm::mprotect(
             stack_ptr,
             MIN_STACK_SIZE,
-            rustix::io::MprotectFlags::READ | rustix::io::MprotectFlags::WRITE,
+            rustix::mm::MprotectFlags::READ | rustix::mm::MprotectFlags::WRITE,
         )
         .expect("mprotect to configure memory for sigaltstack failed");
         let new_stack = libc::stack_t {
@@ -325,17 +348,17 @@ pub fn lazy_per_thread_init() -> Result<(), Box<Trap>> {
             io::Error::last_os_error()
         );
 
-        Ok(Some(Stack {
+        Some(Stack {
             mmap_ptr: ptr,
             mmap_size: alloc_size,
-        }))
+        })
     }
 
     impl Drop for Stack {
         fn drop(&mut self) {
             unsafe {
                 // Deallocate the stack memory.
-                let r = rustix::io::munmap(self.mmap_ptr, self.mmap_size);
+                let r = rustix::mm::munmap(self.mmap_ptr, self.mmap_size);
                 debug_assert!(r.is_ok(), "munmap failed during thread shutdown");
             }
         }

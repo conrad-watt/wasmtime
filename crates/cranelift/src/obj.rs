@@ -13,7 +13,6 @@
 //! function body, the imported wasm function do not. The trampolines symbol
 //! names have format "_trampoline_N", where N is `SignatureIndex`.
 
-use crate::debug::{DwarfSection, DwarfSectionRelocTarget};
 use crate::{CompiledFunction, RelocationTarget};
 use anyhow::Result;
 use cranelift_codegen::isa::{
@@ -23,48 +22,14 @@ use cranelift_codegen::isa::{
 use cranelift_codegen::TextSectionBuilder;
 use gimli::write::{Address, EhFrame, EndianVec, FrameTable, Writer};
 use gimli::RunTimeEndian;
-use object::write::{
-    Object, Relocation as ObjectRelocation, SectionId, StandardSegment, Symbol, SymbolId,
-    SymbolSection,
-};
-use object::{
-    Architecture, RelocationEncoding, RelocationKind, SectionKind, SymbolFlags, SymbolKind,
-    SymbolScope,
-};
-use std::collections::HashMap;
+use object::write::{Object, SectionId, StandardSegment, Symbol, SymbolId, SymbolSection};
+use object::{Architecture, SectionKind, SymbolFlags, SymbolKind, SymbolScope};
 use std::convert::TryFrom;
 use std::ops::Range;
 use wasmtime_environ::obj;
-use wasmtime_environ::{
-    DefinedFuncIndex, EntityRef, FuncIndex, Module, PrimaryMap, SignatureIndex, Trampoline,
-};
+use wasmtime_environ::{DefinedFuncIndex, Module, PrimaryMap, SignatureIndex, Trampoline};
 
 const TEXT_SECTION_NAME: &[u8] = b".text";
-
-/// Iterates through all `LibCall` members and all runtime exported functions.
-#[macro_export]
-macro_rules! for_each_libcall {
-    ($op:ident) => {
-        $op![
-            (UdivI64, wasmtime_i64_udiv),
-            (UdivI64, wasmtime_i64_udiv),
-            (SdivI64, wasmtime_i64_sdiv),
-            (UremI64, wasmtime_i64_urem),
-            (SremI64, wasmtime_i64_srem),
-            (IshlI64, wasmtime_i64_ishl),
-            (UshrI64, wasmtime_i64_ushr),
-            (SshrI64, wasmtime_i64_sshr),
-            (CeilF32, wasmtime_f32_ceil),
-            (FloorF32, wasmtime_f32_floor),
-            (TruncF32, wasmtime_f32_trunc),
-            (NearestF32, wasmtime_f32_nearest),
-            (CeilF64, wasmtime_f64_ceil),
-            (FloorF64, wasmtime_f64_floor),
-            (TruncF64, wasmtime_f64_trunc),
-            (NearestF64, wasmtime_f64_nearest)
-        ];
-    };
-}
 
 /// A helper structure used to assemble the final text section of an exectuable,
 /// plus unwinding information and other related details.
@@ -72,7 +37,7 @@ macro_rules! for_each_libcall {
 /// This builder relies on Cranelift-specific internals but assembles into a
 /// generic `Object` which will get further appended to in a compiler-agnostic
 /// fashion later.
-pub struct ObjectBuilder<'a> {
+pub struct ModuleTextBuilder<'a> {
     /// The target that we're compiling for, used to query target-specific
     /// information as necessary.
     isa: &'a dyn TargetIsa,
@@ -83,49 +48,21 @@ pub struct ObjectBuilder<'a> {
     /// The WebAssembly module we're generating code for.
     module: &'a Module,
 
-    windows_unwind_info_id: Option<SectionId>,
+    text_section: SectionId,
 
-    /// Packed form of windows unwind tables which, if present, will get emitted
-    /// to a windows-specific unwind info section.
-    windows_unwind_info: Vec<RUNTIME_FUNCTION>,
-
-    systemv_unwind_info_id: Option<SectionId>,
-
-    /// Pending unwinding information for DWARF-based platforms. This is used to
-    /// build a `.eh_frame` lookalike at the very end of object building.
-    systemv_unwind_info: Vec<(u64, &'a systemv::UnwindInfo)>,
+    unwind_info: UnwindInfoBuilder<'a>,
 
     /// The corresponding symbol for each function, inserted as they're defined.
     ///
     /// If an index isn't here yet then it hasn't been defined yet.
-    func_symbols: PrimaryMap<FuncIndex, SymbolId>,
-
-    /// `object`-crate identifier for the text section.
-    text_section: SectionId,
+    func_symbols: PrimaryMap<DefinedFuncIndex, SymbolId>,
 
     /// In-progress text section that we're using cranelift's `MachBuffer` to
     /// build to resolve relocations (calls) between functions.
-    pub text: Box<dyn TextSectionBuilder>,
-
-    /// The unwind info _must_ come directly after the text section. Our FDE's
-    /// instructions are encoded to rely on this placement. We use this `bool`
-    /// for debug assertions to ensure that we get the ordering correct.
-    added_unwind_info: bool,
+    text: Box<dyn TextSectionBuilder>,
 }
 
-// This is a mirror of `RUNTIME_FUNCTION` in the Windows API, but defined here
-// to ensure everything is always `u32` and to have it available on all
-// platforms. Note that all of these specifiers here are relative to a "base
-// address" which we define as the base of where the text section is eventually
-// loaded.
-#[allow(non_camel_case_types)]
-struct RUNTIME_FUNCTION {
-    begin: u32,
-    end: u32,
-    unwind_address: u32,
-}
-
-impl<'a> ObjectBuilder<'a> {
+impl<'a> ModuleTextBuilder<'a> {
     pub fn new(obj: &'a mut Object<'static>, module: &'a Module, isa: &'a dyn TargetIsa) -> Self {
         // Entire code (functions and trampolines) will be placed
         // in the ".text" section.
@@ -135,37 +72,15 @@ impl<'a> ObjectBuilder<'a> {
             SectionKind::Text,
         );
 
-        // Create symbols for imports -- needed during linking.
-        let mut func_symbols = PrimaryMap::with_capacity(module.functions.len());
-        for index in 0..module.num_imported_funcs {
-            let symbol_id = obj.add_symbol(Symbol {
-                name: obj::func_symbol_name(FuncIndex::new(index))
-                    .as_bytes()
-                    .to_vec(),
-                value: 0,
-                size: 0,
-                kind: SymbolKind::Text,
-                scope: SymbolScope::Linkage,
-                weak: false,
-                section: SymbolSection::Undefined,
-                flags: SymbolFlags::None,
-            });
-            func_symbols.push(symbol_id);
-        }
-
+        let num_defined = module.functions.len() - module.num_imported_funcs;
         Self {
             isa,
             obj,
             module,
             text_section,
-            func_symbols,
-            windows_unwind_info_id: None,
-            windows_unwind_info: Vec::new(),
-            systemv_unwind_info_id: None,
-            systemv_unwind_info: Vec::new(),
-            text: isa
-                .text_section_builder((module.functions.len() - module.num_imported_funcs) as u32),
-            added_unwind_info: false,
+            func_symbols: PrimaryMap::with_capacity(num_defined),
+            unwind_info: Default::default(),
+            text: isa.text_section_builder(num_defined as u32),
         }
     }
 
@@ -173,7 +88,7 @@ impl<'a> ObjectBuilder<'a> {
     ///
     /// Returns the symbol associated with the function as well as the range
     /// that the function resides within the text section.
-    fn append_func(
+    pub fn append_func(
         &mut self,
         labeled: bool,
         name: Vec<u8>,
@@ -193,35 +108,8 @@ impl<'a> ObjectBuilder<'a> {
             flags: SymbolFlags::None,
         });
 
-        match &func.unwind_info {
-            // Windows unwind information is preferred to come after the code
-            // itself. The information is appended here just after the function,
-            // aligned to 4-bytes as required by Windows.
-            //
-            // The location of the unwind info, and the function it describes,
-            // is then recorded in an unwind info table to get embedded into the
-            // object at the end of compilation.
-            Some(UnwindInfo::WindowsX64(info)) => {
-                // Windows prefers Unwind info after the code -- writing it here.
-                let unwind_size = info.emit_size();
-                let mut unwind_info = vec![0; unwind_size];
-                info.emit(&mut unwind_info);
-                let unwind_off = self.text.append(false, &unwind_info, Some(4));
-                self.windows_unwind_info.push(RUNTIME_FUNCTION {
-                    begin: u32::try_from(off).unwrap(),
-                    end: u32::try_from(off + body_len).unwrap(),
-                    unwind_address: u32::try_from(unwind_off).unwrap(),
-                });
-            }
-
-            // System-V is different enough that we just record the unwinding
-            // information to get processed at a later time.
-            Some(UnwindInfo::SystemV(info)) => {
-                self.systemv_unwind_info.push((off, info));
-            }
-
-            Some(_) => panic!("some unwind info isn't handled here"),
-            None => {}
+        if let Some(info) = &func.unwind_info {
+            self.unwind_info.push(off, body_len, info);
         }
 
         for r in func.relocations.iter() {
@@ -272,18 +160,15 @@ impl<'a> ObjectBuilder<'a> {
     ///
     /// This is expected to be called in-order for ascending `index` values.
     pub fn func(&mut self, index: DefinedFuncIndex, func: &'a CompiledFunction) -> Range<u64> {
-        assert!(!self.added_unwind_info);
-        let index = self.module.func_index(index);
-        let name = obj::func_symbol_name(index);
+        let name = obj::func_symbol_name(self.module.func_index(index));
         let (symbol_id, range) = self.append_func(true, name.into_bytes(), func);
         assert_eq!(self.func_symbols.push(symbol_id), index);
         range
     }
 
     pub fn trampoline(&mut self, sig: SignatureIndex, func: &'a CompiledFunction) -> Trampoline {
-        assert!(!self.added_unwind_info);
         let name = obj::trampoline_symbol_name(sig);
-        let (_, range) = self.append_func(false, name.into_bytes(), func);
+        let range = self.named_func(&name, func);
         Trampoline {
             signature: sig,
             start: range.start,
@@ -291,129 +176,220 @@ impl<'a> ObjectBuilder<'a> {
         }
     }
 
-    pub fn dwarf_sections(&mut self, sections: &[DwarfSection]) -> Result<()> {
-        assert!(
-            self.added_unwind_info,
-            "can't add dwarf yet; unwind info must directly follow the text section"
-        );
-
-        // If we have DWARF data, write it in the object file.
-        let (debug_bodies, debug_relocs): (Vec<_>, Vec<_>) = sections
-            .iter()
-            .map(|s| ((s.name, &s.body), (s.name, &s.relocs)))
-            .unzip();
-        let mut dwarf_sections_ids = HashMap::new();
-        for (name, body) in debug_bodies {
-            let segment = self.obj.segment_name(StandardSegment::Debug).to_vec();
-            let section_id =
-                self.obj
-                    .add_section(segment, name.as_bytes().to_vec(), SectionKind::Debug);
-            dwarf_sections_ids.insert(name, section_id);
-            self.obj.append_section_data(section_id, &body, 1);
-        }
-
-        // Write all debug data relocations.
-        for (name, relocs) in debug_relocs {
-            let section_id = *dwarf_sections_ids.get(name).unwrap();
-            for reloc in relocs {
-                let target_symbol = match reloc.target {
-                    DwarfSectionRelocTarget::Func(index) => {
-                        self.func_symbols[self.module.func_index(DefinedFuncIndex::new(index))]
-                    }
-                    DwarfSectionRelocTarget::Section(name) => {
-                        self.obj.section_symbol(dwarf_sections_ids[name])
-                    }
-                };
-                self.obj.add_relocation(
-                    section_id,
-                    ObjectRelocation {
-                        offset: u64::from(reloc.offset),
-                        size: reloc.size << 3,
-                        kind: RelocationKind::Absolute,
-                        encoding: RelocationEncoding::Generic,
-                        symbol: target_symbol,
-                        addend: i64::from(reloc.addend),
-                    },
-                )?;
-            }
-        }
-
-        Ok(())
+    pub fn named_func(&mut self, name: &str, func: &'a CompiledFunction) -> Range<u64> {
+        let (_, range) = self.append_func(false, name.as_bytes().to_vec(), func);
+        range
     }
 
-    pub fn unwind_info(&mut self) {
-        assert!(!self.added_unwind_info);
-
-        if self.windows_unwind_info.len() > 0 {
-            let segment = self.obj.segment_name(StandardSegment::Data).to_vec();
-            self.windows_unwind_info_id = Some(self.obj.add_section(
-                segment,
-                b"_wasmtime_winx64_unwind".to_vec(),
-                SectionKind::ReadOnlyData,
-            ));
-        }
-        if self.systemv_unwind_info.len() > 0 {
-            let segment = self.obj.segment_name(StandardSegment::Data).to_vec();
-            self.systemv_unwind_info_id = Some(self.obj.add_section(
-                segment,
-                b".eh_frame".to_vec(),
-                SectionKind::ReadOnlyData,
-            ));
-        }
-
-        self.added_unwind_info = true;
+    /// Forces "veneers" to be used for inter-function calls in the text
+    /// section which means that in-bounds optimized addresses are never used.
+    ///
+    /// This is only useful for debugging cranelift itself and typically this
+    /// option is disabled.
+    pub fn force_veneers(&mut self) {
+        self.text.force_veneers();
     }
 
-    pub fn finish(&mut self) -> Result<()> {
+    /// Appends the specified amount of bytes of padding into the text section.
+    ///
+    /// This is only useful when fuzzing and/or debugging cranelift itself and
+    /// for production scenarios `padding` is 0 and this function does nothing.
+    pub fn append_padding(&mut self, padding: usize) {
+        if padding == 0 {
+            return;
+        }
+        self.text.append(false, &vec![0; padding], Some(1));
+    }
+
+    /// Indicates that the text section has been written completely and this
+    /// will finish appending it to the original object.
+    ///
+    /// Note that this will also write out the unwind information sections if
+    /// necessary.
+    pub fn finish(mut self) -> Result<PrimaryMap<DefinedFuncIndex, SymbolId>> {
         // Finish up the text section now that we're done adding functions.
         let text = self.text.finish();
         self.obj
             .section_mut(self.text_section)
             .set_data(text, self.isa.code_section_alignment());
 
-        // With all functions added we can also emit the fully-formed unwinding
-        // information sections.
-        if self.windows_unwind_info.len() > 0 {
-            self.append_windows_unwind_info();
+        // Append the unwind information for all our functions, if necessary.
+        self.unwind_info
+            .append_section(self.isa, self.obj, self.text_section);
+
+        Ok(self.func_symbols)
+    }
+}
+
+/// Builder used to create unwind information for a set of functions added to a
+/// text section.
+#[derive(Default)]
+struct UnwindInfoBuilder<'a> {
+    windows_xdata: Vec<u8>,
+    windows_pdata: Vec<RUNTIME_FUNCTION>,
+    systemv_unwind_info: Vec<(u64, &'a systemv::UnwindInfo)>,
+}
+
+// This is a mirror of `RUNTIME_FUNCTION` in the Windows API, but defined here
+// to ensure everything is always `u32` and to have it available on all
+// platforms. Note that all of these specifiers here are relative to a "base
+// address" which we define as the base of where the text section is eventually
+// loaded.
+#[allow(non_camel_case_types)]
+struct RUNTIME_FUNCTION {
+    begin: u32,
+    end: u32,
+    unwind_address: u32,
+}
+
+impl<'a> UnwindInfoBuilder<'a> {
+    /// Pushes the unwind information for a function into this builder.
+    ///
+    /// The function being described must be located at `function_offset` within
+    /// the text section itself, and the function's size is specified by
+    /// `function_len`.
+    ///
+    /// The `info` should come from Cranelift. and is handled here depending on
+    /// its flavor.
+    fn push(&mut self, function_offset: u64, function_len: u64, info: &'a UnwindInfo) {
+        match info {
+            // Windows unwind information is stored in two locations:
+            //
+            // * First is the actual unwinding information which is stored
+            //   in the `.xdata` section. This is where `info`'s emitted
+            //   information will go into.
+            // * Second are pointers to connect all this unwind information,
+            //   stored in the `.pdata` section. The `.pdata` section is an
+            //   array of `RUNTIME_FUNCTION` structures.
+            //
+            // Due to how these will be loaded at runtime the `.pdata` isn't
+            // actually assembled byte-wise here. Instead that's deferred to
+            // happen later during `write_windows_unwind_info` which will apply
+            // a further offset to `unwind_address`.
+            UnwindInfo::WindowsX64(info) => {
+                let unwind_size = info.emit_size();
+                let mut unwind_info = vec![0; unwind_size];
+                info.emit(&mut unwind_info);
+
+                // `.xdata` entries are always 4-byte aligned
+                //
+                // FIXME: in theory we could "intern" the `unwind_info` value
+                // here within the `.xdata` section. Most of our unwind
+                // information for functions is probably pretty similar in which
+                // case the `.xdata` could be quite small and `.pdata` could
+                // have multiple functions point to the same unwinding
+                // information.
+                while self.windows_xdata.len() % 4 != 0 {
+                    self.windows_xdata.push(0x00);
+                }
+                let unwind_address = self.windows_xdata.len();
+                self.windows_xdata.extend_from_slice(&unwind_info);
+
+                // Record a `RUNTIME_FUNCTION` which this will point to.
+                self.windows_pdata.push(RUNTIME_FUNCTION {
+                    begin: u32::try_from(function_offset).unwrap(),
+                    end: u32::try_from(function_offset + function_len).unwrap(),
+                    unwind_address: u32::try_from(unwind_address).unwrap(),
+                });
+            }
+
+            // System-V is different enough that we just record the unwinding
+            // information to get processed at a later time.
+            UnwindInfo::SystemV(info) => {
+                self.systemv_unwind_info.push((function_offset, info));
+            }
+
+            _ => panic!("some unwind info isn't handled here"),
         }
-        if self.systemv_unwind_info.len() > 0 {
-            self.append_systemv_unwind_info();
+    }
+
+    /// Appends the unwind information section, if any, to the `obj` specified.
+    ///
+    /// This function must be called immediately after the text section was
+    /// added to a builder. The unwind information section must trail the text
+    /// section immediately.
+    ///
+    /// The `text_section`'s section identifier is passed into this function.
+    fn append_section(&self, isa: &dyn TargetIsa, obj: &mut Object<'_>, text_section: SectionId) {
+        // This write will align the text section to a page boundary and then
+        // return the offset at that point. This gives us the full size of the
+        // text section at that point, after alignment.
+        let text_section_size =
+            obj.append_section_data(text_section, &[], isa.code_section_alignment());
+
+        if self.windows_xdata.len() > 0 {
+            assert!(self.systemv_unwind_info.len() == 0);
+            // The `.xdata` section must come first to be just-after the `.text`
+            // section for the reasons documented in `write_windows_unwind_info`
+            // below.
+            let segment = obj.segment_name(StandardSegment::Data).to_vec();
+            let xdata_id = obj.add_section(segment, b".xdata".to_vec(), SectionKind::ReadOnlyData);
+            let segment = obj.segment_name(StandardSegment::Data).to_vec();
+            let pdata_id = obj.add_section(segment, b".pdata".to_vec(), SectionKind::ReadOnlyData);
+            self.write_windows_unwind_info(obj, xdata_id, pdata_id, text_section_size);
         }
 
-        Ok(())
+        if self.systemv_unwind_info.len() > 0 {
+            let segment = obj.segment_name(StandardSegment::Data).to_vec();
+            let section_id =
+                obj.add_section(segment, b".eh_frame".to_vec(), SectionKind::ReadOnlyData);
+            self.write_systemv_unwind_info(isa, obj, section_id, text_section_size)
+        }
     }
 
     /// This function appends a nonstandard section to the object which is only
-    /// used during `CodeMemory::allocate_for_object`.
+    /// used during `CodeMemory::publish`.
     ///
     /// This custom section effectively stores a `[RUNTIME_FUNCTION; N]` into
     /// the object file itself. This way registration of unwind info can simply
     /// pass this slice to the OS itself and there's no need to recalculate
     /// anything on the other end of loading a module from a precompiled object.
-    fn append_windows_unwind_info(&mut self) {
+    ///
+    /// Support for reading this is in `crates/jit/src/unwind/winx64.rs`.
+    fn write_windows_unwind_info(
+        &self,
+        obj: &mut Object<'_>,
+        xdata_id: SectionId,
+        pdata_id: SectionId,
+        text_section_size: u64,
+    ) {
         // Currently the binary format supported here only supports
         // little-endian for x86_64, or at least that's all where it's tested.
         // This may need updates for other platforms.
-        assert_eq!(self.obj.architecture(), Architecture::X86_64);
+        assert_eq!(obj.architecture(), Architecture::X86_64);
 
-        let section_id = self.windows_unwind_info_id.unwrap();
+        // Append the `.xdata` section, or the actual unwinding information
+        // codes and such which were built as we found unwind information for
+        // functions.
+        obj.append_section_data(xdata_id, &self.windows_xdata, 4);
 
-        // Page-align the text section so the unwind info can reside on a
-        // separate page that doesn't need executable permissions.
-        self.obj
-            .append_section_data(self.text_section, &[], self.isa.code_section_alignment());
-
-        let mut unwind_info = Vec::with_capacity(self.windows_unwind_info.len() * 3 * 4);
-        for info in self.windows_unwind_info.iter() {
-            unwind_info.extend_from_slice(&info.begin.to_le_bytes());
-            unwind_info.extend_from_slice(&info.end.to_le_bytes());
-            unwind_info.extend_from_slice(&info.unwind_address.to_le_bytes());
+        // Next append the `.pdata` section, or the array of `RUNTIME_FUNCTION`
+        // structures stored in the binary.
+        //
+        // This memory will be passed at runtime to `RtlAddFunctionTable` which
+        // takes a "base address" and the entries within `RUNTIME_FUNCTION` are
+        // all relative to this base address. The base address we pass is the
+        // address of the text section itself so all the pointers here must be
+        // text-section-relative. The `begin` and `end` fields for the function
+        // it describes are already text-section-relative, but the
+        // `unwind_address` field needs to be updated here since the value
+        // stored right now is `xdata`-section-relative. We know that the
+        // `xdata` section follows the `.text` section so the
+        // `text_section_size` is added in to calculate the final
+        // `.text`-section-relative address of the unwind information.
+        let mut pdata = Vec::with_capacity(self.windows_pdata.len() * 3 * 4);
+        for info in self.windows_pdata.iter() {
+            pdata.extend_from_slice(&info.begin.to_le_bytes());
+            pdata.extend_from_slice(&info.end.to_le_bytes());
+            let address = text_section_size + u64::from(info.unwind_address);
+            let address = u32::try_from(address).unwrap();
+            pdata.extend_from_slice(&address.to_le_bytes());
         }
-        self.obj.append_section_data(section_id, &unwind_info, 4);
+        obj.append_section_data(pdata_id, &pdata, 4);
     }
 
     /// This function appends a nonstandard section to the object which is only
-    /// used during `CodeMemory::allocate_for_object`.
+    /// used during `CodeMemory::publish`.
     ///
     /// This will generate a `.eh_frame` section, but not one that can be
     /// naively loaded. The goal of this section is that we can create the
@@ -450,22 +426,20 @@ impl<'a> ObjectBuilder<'a> {
     /// This allows `.eh_frame` to have different virtual memory permissions,
     /// such as being purely read-only instead of read/execute like the code
     /// bits.
-    fn append_systemv_unwind_info(&mut self) {
-        let section_id = self.systemv_unwind_info_id.unwrap();
-        let mut cie = self
-            .isa
+    fn write_systemv_unwind_info(
+        &self,
+        isa: &dyn TargetIsa,
+        obj: &mut Object<'_>,
+        section_id: SectionId,
+        text_section_size: u64,
+    ) {
+        let mut cie = isa
             .create_systemv_cie()
             .expect("must be able to create a CIE for system-v unwind info");
         let mut table = FrameTable::default();
         cie.fde_address_encoding = gimli::constants::DW_EH_PE_pcrel;
         let cie_id = table.add_cie(cie);
 
-        // This write will align the text section to a page boundary
-        // and then return the offset at that point. This gives us the full size
-        // of the text section at that point, after alignment.
-        let text_section_size =
-            self.obj
-                .append_section_data(self.text_section, &[], self.isa.code_section_alignment());
         for (text_section_off, unwind_info) in self.systemv_unwind_info.iter() {
             let backwards_off = text_section_size - text_section_off;
             let actual_offset = -i64::try_from(backwards_off).unwrap();
@@ -476,7 +450,7 @@ impl<'a> ObjectBuilder<'a> {
             let fde = unwind_info.to_fde(Address::Constant(actual_offset as u64));
             table.add_fde(cie_id, fde);
         }
-        let endian = match self.isa.triple().endianness().unwrap() {
+        let endian = match isa.triple().endianness().unwrap() {
             target_lexicon::Endianness::Little => RunTimeEndian::Little,
             target_lexicon::Endianness::Big => RunTimeEndian::Big,
         };
@@ -487,8 +461,7 @@ impl<'a> ObjectBuilder<'a> {
         // a 0 is written at the end of the table for those implementations.
         let mut endian_vec = (eh_frame.0).0;
         endian_vec.write_u32(0).unwrap();
-        self.obj
-            .append_section_data(section_id, endian_vec.slice(), 1);
+        obj.append_section_data(section_id, endian_vec.slice(), 1);
 
         use gimli::constants;
         use gimli::write::Error;

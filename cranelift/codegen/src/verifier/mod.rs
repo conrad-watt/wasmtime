@@ -27,6 +27,7 @@
 //! - All predecessors in the CFG must be branches to the block.
 //! - All branches to a block must be present in the CFG.
 //! - A recomputed dominator tree is identical to the existing one.
+//! - The entry block must not be a cold block.
 //!
 //! Type checking
 //!
@@ -65,8 +66,8 @@ use crate::ir;
 use crate::ir::entities::AnyEntity;
 use crate::ir::instructions::{BranchInfo, CallInfo, InstructionFormat, ResolvedConstraint};
 use crate::ir::{
-    types, ArgumentPurpose, Block, Constant, FuncRef, Function, GlobalValue, Inst, JumpTable,
-    Opcode, SigRef, StackSlot, Type, Value, ValueDef, ValueList,
+    types, ArgumentPurpose, Block, Constant, DynamicStackSlot, FuncRef, Function, GlobalValue,
+    Inst, JumpTable, Opcode, SigRef, StackSlot, Type, Value, ValueDef, ValueList,
 };
 use crate::isa::TargetIsa;
 use crate::iterators::IteratorExtras;
@@ -681,6 +682,14 @@ impl<'a> Verifier<'a> {
             StackLoad { stack_slot, .. } | StackStore { stack_slot, .. } => {
                 self.verify_stack_slot(inst, stack_slot, errors)?;
             }
+            DynamicStackLoad {
+                dynamic_stack_slot, ..
+            }
+            | DynamicStackStore {
+                dynamic_stack_slot, ..
+            } => {
+                self.verify_dynamic_stack_slot(inst, dynamic_stack_slot, errors)?;
+            }
             UnaryGlobalValue { global_value, .. } => {
                 self.verify_global_value(inst, global_value, errors)?;
             }
@@ -710,6 +719,26 @@ impl<'a> Verifier<'a> {
                         inst,
                         self.context(inst),
                         "GetPinnedReg/SetPinnedReg need an ISA!",
+                    ));
+                }
+            }
+            NullAry {
+                opcode: Opcode::GetFramePointer | Opcode::GetReturnAddress,
+            } => {
+                if let Some(isa) = &self.isa {
+                    if !isa.flags().preserve_frame_pointers() {
+                        return errors.fatal((
+                            inst,
+                            self.context(inst),
+                            "`get_frame_pointer`/`get_return_address` cannot be used without \
+                             enabling `preserve_frame_pointers`",
+                        ));
+                    }
+                } else {
+                    return errors.fatal((
+                        inst,
+                        self.context(inst),
+                        "`get_frame_pointer`/`get_return_address` require an ISA!",
                     ));
                 }
             }
@@ -819,11 +848,28 @@ impl<'a> Verifier<'a> {
         ss: StackSlot,
         errors: &mut VerifierErrors,
     ) -> VerifierStepResult<()> {
-        if !self.func.stack_slots.is_valid(ss) {
+        if !self.func.sized_stack_slots.is_valid(ss) {
             errors.nonfatal((
                 inst,
                 self.context(inst),
                 format!("invalid stack slot {}", ss),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn verify_dynamic_stack_slot(
+        &self,
+        inst: Inst,
+        ss: DynamicStackSlot,
+        errors: &mut VerifierErrors,
+    ) -> VerifierStepResult<()> {
+        if !self.func.dynamic_stack_slots.is_valid(ss) {
+            errors.nonfatal((
+                inst,
+                self.context(inst),
+                format!("invalid dynamic stack slot {}", ss),
             ))
         } else {
             Ok(())
@@ -1176,6 +1222,16 @@ impl<'a> Verifier<'a> {
             }
         }
 
+        errors.as_result()
+    }
+
+    fn check_entry_not_cold(&self, errors: &mut VerifierErrors) -> VerifierStepResult<()> {
+        if let Some(entry_block) = self.func.layout.entry_block() {
+            if self.func.layout.is_cold(entry_block) {
+                return errors
+                    .fatal((entry_block, format!("entry block cannot be marked as cold")));
+            }
+        }
         errors.as_result()
     }
 
@@ -1646,7 +1702,7 @@ impl<'a> Verifier<'a> {
                 // We must be specific about the opcodes above because other instructions are using
                 // the same formats.
                 let ty = self.func.dfg.value_type(arg);
-                if u16::from(lane) >= ty.lane_count() {
+                if lane as u32 >= ty.lane_count() {
                     errors.fatal((
                         inst,
                         self.context(inst),
@@ -1714,6 +1770,7 @@ impl<'a> Verifier<'a> {
         self.verify_tables(errors)?;
         self.verify_jump_tables(errors)?;
         self.typecheck_entry_block_params(errors)?;
+        self.check_entry_not_cold(errors)?;
         self.typecheck_function_signature(errors)?;
 
         for block in self.func.layout.blocks() {
@@ -1788,8 +1845,8 @@ mod tests {
             imm: 0.into(),
         });
         func.layout.append_inst(nullary_with_bad_opcode, block0);
-        func.layout.append_inst(
-            func.dfg.make_inst(InstructionData::Jump {
+        func.stencil.layout.append_inst(
+            func.stencil.dfg.make_inst(InstructionData::Jump {
                 opcode: Opcode::Jump,
                 destination: block0,
                 args: EntityList::default(),

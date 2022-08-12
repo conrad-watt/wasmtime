@@ -41,7 +41,12 @@ pub trait FuncWriter {
     fn super_preamble(&mut self, w: &mut dyn Write, func: &Function) -> Result<bool, fmt::Error> {
         let mut any = false;
 
-        for (ss, slot) in func.stack_slots.iter() {
+        for (ss, slot) in func.dynamic_stack_slots.iter() {
+            any = true;
+            self.write_entity_definition(w, func, ss.into(), slot)?;
+        }
+
+        for (ss, slot) in func.sized_stack_slots.iter() {
             any = true;
             self.write_entity_definition(w, func, ss.into(), slot)?;
         }
@@ -75,7 +80,12 @@ pub trait FuncWriter {
         for (fnref, ext_func) in &func.dfg.ext_funcs {
             if ext_func.signature != SigRef::reserved_value() {
                 any = true;
-                self.write_entity_definition(w, func, fnref.into(), ext_func)?;
+                self.write_entity_definition(
+                    w,
+                    func,
+                    fnref.into(),
+                    &ext_func.display(Some(&func.params)),
+                )?;
             }
         }
 
@@ -249,7 +259,7 @@ fn decorate_block<FW: FuncWriter>(
     block: Block,
 ) -> fmt::Result {
     // Indent all instructions if any srclocs are present.
-    let indent = if func.srclocs.is_empty() { 4 } else { 36 };
+    let indent = if func.rel_srclocs().is_empty() { 4 } else { 36 };
 
     func_w.write_block_header(w, func, block, indent)?;
     for a in func.dfg.block_params(block).iter().cloned() {
@@ -330,7 +340,7 @@ fn write_instruction(
     let mut s = String::with_capacity(16);
 
     // Source location goes first.
-    let srcloc = func.srclocs[inst];
+    let srcloc = func.srcloc(inst);
     if !srcloc.is_default() {
         write!(s, "{} ", srcloc)?;
     }
@@ -375,7 +385,7 @@ pub fn write_operands(w: &mut dyn Write, dfg: &DataFlowGraph, inst: Inst) -> fmt
     let pool = &dfg.value_lists;
     use crate::ir::instructions::InstructionData::*;
     match dfg[inst] {
-        AtomicRmw { op, args, .. } => write!(w, " {}, {}, {}", op, args[0], args[1]),
+        AtomicRmw { op, args, .. } => write!(w, " {} {}, {}", op, args[0], args[1]),
         AtomicCas { args, .. } => write!(w, " {}, {}, {}", args[0], args[1], args[2]),
         LoadNoOffset { flags, arg, .. } => write!(w, "{} {}", flags, arg),
         StoreNoOffset { flags, args, .. } => write!(w, "{} {}, {}", flags, args[0], args[1]),
@@ -493,6 +503,14 @@ pub fn write_operands(w: &mut dyn Write, dfg: &DataFlowGraph, inst: Inst) -> fmt
             offset,
             ..
         } => write!(w, " {}, {}{}", arg, stack_slot, offset),
+        DynamicStackLoad {
+            dynamic_stack_slot, ..
+        } => write!(w, " {}", dynamic_stack_slot),
+        DynamicStackStore {
+            arg,
+            dynamic_stack_slot,
+            ..
+        } => write!(w, " {}, {}", arg, dynamic_stack_slot),
         HeapAddr { heap, arg, imm, .. } => write!(w, " {}, {}, {}", heap, arg, imm),
         TableAddr { table, arg, .. } => write!(w, " {}, {}", table, arg),
         Load {
@@ -559,7 +577,7 @@ impl<'a> fmt::Display for DisplayValuesWithDelimiter<'a> {
 mod tests {
     use crate::cursor::{Cursor, CursorPosition, FuncCursor};
     use crate::ir::types;
-    use crate::ir::{ExternalName, Function, InstBuilder, StackSlotData, StackSlotKind};
+    use crate::ir::{Function, InstBuilder, StackSlotData, StackSlotKind, UserFuncName};
     use alloc::string::ToString;
 
     #[test]
@@ -567,10 +585,10 @@ mod tests {
         let mut f = Function::new();
         assert_eq!(f.to_string(), "function u0:0() fast {\n}\n");
 
-        f.name = ExternalName::testcase("foo");
+        f.name = UserFuncName::testcase("foo");
         assert_eq!(f.to_string(), "function %foo() fast {\n}\n");
 
-        f.create_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 4));
+        f.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 4));
         assert_eq!(
             f.to_string(),
             "function %foo() fast {\n    ss0 = explicit_slot 4\n}\n"

@@ -1,6 +1,5 @@
 //! Generate instruction data (including opcodes, formats, builders, etc.).
 use std::fmt;
-use std::path::Path;
 
 use cranelift_codegen_shared::constant_hash;
 
@@ -67,7 +66,7 @@ fn gen_formats(formats: &[&InstructionFormat], fmt: &mut Formatter) {
 /// 16 bytes on 64-bit architectures. If more space is needed to represent an instruction, use a
 /// `ValueList` to store the additional information out of line.
 fn gen_instruction_data(formats: &[&InstructionFormat], fmt: &mut Formatter) {
-    fmt.line("#[derive(Clone, Debug)]");
+    fmt.line("#[derive(Clone, Debug, PartialEq, Hash)]");
     fmt.line(r#"#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]"#);
     fmt.line("#[allow(missing_docs)]");
     fmt.line("pub enum InstructionData {");
@@ -689,6 +688,7 @@ pub(crate) fn gen_typesets_table(type_sets: &UniqueTable<TypeSet>, fmt: &mut For
             fmt.indent(|fmt| {
                 fmt.comment(typeset_to_string(ts));
                 gen_bitset(&ts.lanes, "lanes", 16, fmt);
+                gen_bitset(&ts.dynamic_lanes, "dynamic_lanes", 16, fmt);
                 gen_bitset(&ts.ints, "ints", 8, fmt);
                 gen_bitset(&ts.floats, "floats", 8, fmt);
                 gen_bitset(&ts.bools, "bools", 8, fmt);
@@ -1085,7 +1085,6 @@ fn gen_inst_builder(inst: &Instruction, format: &InstructionFormat, fmt: &mut Fo
     fmtln!(fmt, "}")
 }
 
-#[cfg(feature = "rebuild-isle")]
 fn gen_isle(formats: &[&InstructionFormat], instructions: &AllInstructions, fmt: &mut Formatter) {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fmt::Write;
@@ -1341,7 +1340,6 @@ fn gen_isle(formats: &[&InstructionFormat], instructions: &AllInstructions, fmt:
 }
 
 /// Generate an `enum` immediate in ISLE.
-#[cfg(feature = "rebuild-isle")]
 fn gen_isle_enum(name: &str, mut variants: Vec<&str>, fmt: &mut Formatter) {
     variants.sort();
     let prefix = format!(";;;; Enumerated Immediate: {} ", name);
@@ -1407,7 +1405,7 @@ pub(crate) fn generate(
     inst_builder_filename: &str,
     isle_filename: &str,
     out_dir: &str,
-    crate_dir: &Path,
+    isle_dir: &str,
 ) -> Result<(), error::Error> {
     // Opcodes.
     let mut fmt = Formatter::new();
@@ -1424,18 +1422,9 @@ pub(crate) fn generate(
     fmt.update_file(opcode_filename, out_dir)?;
 
     // ISLE DSL.
-    #[cfg(feature = "rebuild-isle")]
-    {
-        let mut fmt = Formatter::new();
-        gen_isle(&formats, all_inst, &mut fmt);
-        let crate_src_dir = crate_dir.join("src");
-        fmt.update_file(isle_filename, &crate_src_dir.display().to_string())?;
-    }
-    #[cfg(not(feature = "rebuild-isle"))]
-    {
-        // Silence unused variable warnings.
-        let _ = (isle_filename, crate_dir);
-    }
+    let mut fmt = Formatter::new();
+    gen_isle(&formats, all_inst, &mut fmt);
+    fmt.update_file(isle_filename, isle_dir)?;
 
     // Instruction builder.
     let mut fmt = Formatter::new();

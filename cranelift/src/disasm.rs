@@ -1,15 +1,15 @@
 use anyhow::Result;
 use cfg_if::cfg_if;
+use cranelift_codegen::ir::function::FunctionParameters;
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::{MachReloc, MachStackMap, MachTrap};
 use std::fmt::Write;
 
-pub fn print_relocs(relocs: &[MachReloc]) -> String {
+fn print_relocs(func_params: &FunctionParameters, relocs: &[MachReloc]) -> String {
     let mut text = String::new();
     for &MachReloc {
         kind,
         offset,
-        srcloc: _,
         ref name,
         addend,
     } in relocs
@@ -17,7 +17,10 @@ pub fn print_relocs(relocs: &[MachReloc]) -> String {
         writeln!(
             text,
             "reloc_external: {} {} {} at {}",
-            kind, name, addend, offset
+            kind,
+            name.display(Some(func_params)),
+            addend,
+            offset
         )
         .unwrap();
     }
@@ -26,26 +29,40 @@ pub fn print_relocs(relocs: &[MachReloc]) -> String {
 
 pub fn print_traps(traps: &[MachTrap]) -> String {
     let mut text = String::new();
-    for &MachTrap {
-        offset,
-        srcloc: _,
-        code,
-    } in traps
-    {
-        writeln!(text, "trap: {} at {}", code, offset).unwrap();
+    for &MachTrap { offset, code } in traps {
+        writeln!(text, "trap: {code} at {offset:#x}").unwrap();
     }
     text
 }
 
 pub fn print_stack_maps(traps: &[MachStackMap]) -> String {
     let mut text = String::new();
-    for &MachStackMap {
+    for MachStackMap {
         offset,
-        offset_end: _,
-        stack_map: _,
+        offset_end,
+        stack_map,
     } in traps
     {
-        writeln!(text, "add_stack_map at {}", offset).unwrap();
+        writeln!(
+            text,
+            "add_stack_map at {offset:#x}-{offset_end:#x} mapped_words={}",
+            stack_map.mapped_words()
+        )
+        .unwrap();
+
+        write!(text, "    entries: ").unwrap();
+        let mut first = true;
+        for i in 0..stack_map.mapped_words() {
+            if !stack_map.get_bit(i as usize) {
+                continue;
+            }
+            if !first {
+                write!(text, ", ").unwrap();
+            } else {
+                first = false;
+            }
+            write!(text, "{i}").unwrap();
+        }
     }
     text
 }
@@ -159,6 +176,7 @@ cfg_if! {
 
 pub fn print_all(
     isa: &dyn TargetIsa,
+    func_params: &FunctionParameters,
     mem: &[u8],
     code_size: u32,
     print: bool,
@@ -171,7 +189,7 @@ pub fn print_all(
     if print {
         println!(
             "\n{}\n{}\n{}",
-            print_relocs(relocs),
+            print_relocs(func_params, relocs),
             print_traps(traps),
             print_stack_maps(stack_maps)
         );

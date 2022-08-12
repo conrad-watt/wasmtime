@@ -1,6 +1,6 @@
 --------------------------------------------------------------------------------
 
-## 0.38.0
+## 0.41.0
 
 Unreleased.
 
@@ -10,9 +10,243 @@ Unreleased.
 
 --------------------------------------------------------------------------------
 
-## 0.37.0
+## 0.40.0
 
 Unreleased.
+
+This was a relatively quiet release in terms of user-facing features where most
+of the work was around the internals of Wasmtime and Cranelift. Improvements
+internally have been made along the lines of:
+
+* Many more instructions are now implemented with ISLE instead of handwritten
+  lowerings.
+* Many improvements to the cranelift-based fuzzing.
+* Many platform improvements for s390x including full SIMD support, running
+  `rustc_codegen_cranelift` with features like `i128`, supporting more
+  ABIs, etc.
+* Much more of the component model has been implemented and is now fuzzed.
+
+Finally this release is currently scheduled to be the last `0.*` release of
+Wasmtime. The upcoming release of Wasmtime on September 20 is planned to be
+Wasmtime's 1.0 release. More information about what 1.0 means for Wasmtime is
+available in the [1.0 RFC]
+
+[1.0 RFC]: https://github.com/bytecodealliance/rfcs/blob/main/accepted/wasmtime-one-dot-oh.md
+
+### Added
+
+* Stack walking has been reimplemented with frame pointers rather than with
+  native unwind information. This means that backtraces are feasible to capture
+  in performance-critical environments and in general stack walking is much
+  faster than before.
+  [#4431](https://github.com/bytecodealliance/wasmtime/pull/4431)
+
+* The WebAssembly `simd` proposal is now fully implemented for the s390x
+  backend.
+  [#4427](https://github.com/bytecodealliance/wasmtime/pull/4427)
+
+* Support for AArch64 has been added in the experimental native debuginfo
+  support that Wasmtime has.
+  [#4468](https://github.com/bytecodealliance/wasmtime/pull/4468)
+
+* Support building the C API of Wasmtime with CMake has been added.
+  [#4369](https://github.com/bytecodealliance/wasmtime/pull/4369)
+
+* Clarification was added to Wasmtime's documentation about "tiers of support"
+  for various features.
+  [#4479](https://github.com/bytecodealliance/wasmtime/pull/4479)
+
+### Fixed
+
+* Support for `filestat_get` has been improved for stdio streams in WASI.
+  [#4531](https://github.com/bytecodealliance/wasmtime/pull/4531)
+
+* Enabling the `vtune` feature no longer breaks builds on AArch64.
+  [#4533](https://github.com/bytecodealliance/wasmtime/pull/4533)
+
+--------------------------------------------------------------------------------
+
+## 0.39.1
+
+Released 2022-07-20.
+
+### Fixed
+
+* An s390x-specific codegen bug in addition to a mistake introduced in the fix
+  of CVE-2022-31146 were fixed.
+  [#4490](https://github.com/bytecodealliance/wasmtime/pull/4490)
+
+--------------------------------------------------------------------------------
+
+## 0.39.0
+
+Released 2022-07-20
+
+### Added
+
+* Initial support for shared memories and the `threads` WebAssembly proposal
+  has been added. Note that this feature is still experimental and not ready
+  for production use yet.
+  [#4187](https://github.com/bytecodealliance/wasmtime/pull/4187)
+
+* A new `Linker::define_unknown_imports_as_traps` method and
+  `--trap-unknown-imports` CLI flag have been added to conveniently support
+  running modules with imports that aren't dynamically called at runtime.
+  [#4312](https://github.com/bytecodealliance/wasmtime/pull/4312)
+
+* The VTune profiling strategy can now be selected through the C API.
+  [#4316](https://github.com/bytecodealliance/wasmtime/pull/4316)
+
+### Changed
+
+* Some methods on the `Config` structure now return `&mut Self` instead of
+  `Result<&mut Self>` since the validation is deferred until `Engine::new`:
+  `profiler`, `cranelift_flag_enable`, `cranelift_flag_set`, `max_wasm_stack`,
+  `async_stack_size`, and `strategy`.
+  [#4252](https://github.com/bytecodealliance/wasmtime/pull/4252)
+  [#4262](https://github.com/bytecodealliance/wasmtime/pull/4262)
+
+* Parallel compilation of WebAssembly modules is now enabled in the C API by
+  default.
+  [#4270](https://github.com/bytecodealliance/wasmtime/pull/4270)
+
+* Implicit Cargo features of the `wasmtime` introduced through `optional`
+  dependencies may have been removed since namespaced features are now used.
+  It's recommended to only used the set of named `[features]` for Wasmtime.
+  [#4293](https://github.com/bytecodealliance/wasmtime/pull/4293)
+
+* Register allocation has fixed a few issues related to excessive memory usage
+  at compile time.
+  [#4324](https://github.com/bytecodealliance/wasmtime/pull/4324)
+
+### Fixed
+
+* A refactor of `Config` was made to fix an issue that the order of calls to `Config`
+  matters now, which may lead to unexpected behavior.
+  [#4252](https://github.com/bytecodealliance/wasmtime/pull/4252)
+  [#4262](https://github.com/bytecodealliance/wasmtime/pull/4262)
+
+* Wasmtime has been fixed to work on SSE2-only x86\_64 platforms when the
+  `simd` feature is disabled in `Config`.
+  [#4231](https://github.com/bytecodealliance/wasmtime/pull/4231)
+
+* Generation of platform-specific unwinding information is disabled if
+  `wasm_backtrace` and `wasm_reference_types` are both disabled.
+  [#4351](https://github.com/bytecodealliance/wasmtime/pull/4351)
+
+--------------------------------------------------------------------------------
+
+## 0.38.3
+
+Released 2022-07-20.
+
+### Fixed.
+
+* An s390x-specific codegen bug in addition to a mistake introduced in the fix
+  of CVE-2022-31146 were fixed.
+  [#4491](https://github.com/bytecodealliance/wasmtime/pull/4491)
+
+--------------------------------------------------------------------------------
+
+## 0.38.2
+
+Released 2022-07-20.
+
+### Fixed.
+
+* A miscompilation when handling constant divisors on AArch64 has been fixed.
+  [CVE-2022-31169](https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-7f6x-jwh5-m9r4)
+
+* A use-after-free possible with accidentally missing stack maps has been fixed.
+  [CVE-2022-31146](https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-5fhj-g3p3-pq9g)
+
+--------------------------------------------------------------------------------
+
+## 0.38.1
+
+Released 2022-06-27.
+
+### Fixed.
+
+* A register allocator bug was fixed that could affect direct users of
+  Cranelift who use struct-return (`sret`) arguments. The bug had to do with
+  the handling of physical register constraints in the function prologue. No
+  impact should be possible for users of Cranelift via the Wasm frontend,
+  including Wasmtime.
+  [regalloc2#60](https://github.com/bytecodealliance/regalloc2/pull/60)
+  [#4333](https://github.com/bytecodealliance/wasmtime/pull/4333)
+
+* Lowering bugs for the `i8x16.swizzle` and `select`-with-`v128`-inputs
+  instructions were fixed for the x86\_64 code generator. Note that aarch64 and
+  s390x are unaffected.
+  [#4334](https://github.com/bytecodealliance/wasmtime/pull/4334)
+
+* A bug in the 8-bit lowering of integer division on x86-64 was fixed in
+  Cranelift that could cause a register allocator panic due to an undefined
+  value in a register. (The divide instruction does not take a register `rdx`
+  as a source when 8 bits but the metadata incorrectly claimed it did.) No
+  impact on Wasm/Wasmtime users, and impact on direct Cranelift embedders
+  limited to compilation panics.
+  [#4332](https://github.com/bytecodealliance/wasmtime/pull/4332)
+
+--------------------------------------------------------------------------------
+
+## 0.38.0
+
+Released 2022-06-21
+
+### Added
+
+* Enabling or disabling NaN canonicalization in generated code is now exposed
+  through the C API.
+  [#4154](https://github.com/bytecodealliance/wasmtime/pull/4154)
+
+* A user-defined callback can now be invoked when an epoch interruption happens
+  via the `Store::epoch_deadline_callback` API.
+  [#4152](https://github.com/bytecodealliance/wasmtime/pull/4152)
+
+* Basic alias analysis with redundant-load elimintation and store-to-load
+  forwarding optimizations has been added to Cranelift.
+  [#4163](https://github.com/bytecodealliance/wasmtime/pull/4163)
+
+### Changed
+
+* Traps originating from epoch-based interruption are now exposed as
+  `TrapCode::Interrupt`.
+  [#4105](https://github.com/bytecodealliance/wasmtime/pull/4105)
+
+* Binary builds for AArch64 now require glibc 2.17 and for s390x require glibc
+  2.16. Previously glibc 2.28 was required.
+  [#4171](https://github.com/bytecodealliance/wasmtime/pull/4171)
+
+* The `wasmtime::ValRaw` now has all of its fields listed as private and instead
+  constructors/accessors are provided for getting at the internal data.
+  [#4186](https://github.com/bytecodealliance/wasmtime/pull/4186)
+
+* The `wasm-backtrace` Cargo feature has been removed in favor of a
+  `Config::wasm_backtrace` runtime configuration option. Additionally backtraces
+  are now only captured when an embedder-generated trap actually reaches a
+  WebAssembly call stack.
+  [#4183](https://github.com/bytecodealliance/wasmtime/pull/4183)
+
+* Usage of `*_unchecked` APIs for `Func` in the `wasmtime` crate and C API now
+  take a `usize` parameter indicating the number of `ValRaw` values behind
+  the associated pointer.
+  [#4192](https://github.com/bytecodealliance/wasmtime/pull/4192)
+
+### Fixed
+
+* An improvement was made to the spill-slot allocation in code generation to fix
+  an issue where some stack slots accidentally weren't reused. This issue was
+  introduced with the landing of regalloc2 in 0.37.0 and may have resulted in
+  larger-than-intended increases in stack frame sizes.
+  [#4222](https://github.com/bytecodealliance/wasmtime/pull/4222)
+
+--------------------------------------------------------------------------------
+
+## 0.37.0
+
+Released 2022-05-20
 
 ### Added
 

@@ -70,8 +70,7 @@ impl crate::isa::unwind::systemv::RegisterMapper<Reg> for RegisterMapper {
 mod tests {
     use crate::cursor::{Cursor, FuncCursor};
     use crate::ir::{
-        types, AbiParam, ExternalName, Function, InstBuilder, Signature, StackSlotData,
-        StackSlotKind,
+        types, AbiParam, Function, InstBuilder, Signature, StackSlotData, StackSlotKind,
     };
     use crate::isa::{lookup, CallConv};
     use crate::settings::{builder, Flags};
@@ -104,12 +103,11 @@ mod tests {
             _ => panic!("expected unwind information"),
         };
 
-        assert_eq!(format!("{:?}", fde), "FrameDescriptionEntry { address: Constant(1234), length: 24, lsda: None, instructions: [(0, ValExpression(Register(34), Expression { operations: [Simple(DwOp(48))] })), (4, CfaOffset(16)), (4, Offset(Register(29), -16)), (4, Offset(Register(30), -8)), (8, CfaRegister(Register(29)))] }");
+        assert_eq!(format!("{:?}", fde), "FrameDescriptionEntry { address: Constant(1234), length: 24, lsda: None, instructions: [(4, CfaOffset(16)), (4, Offset(Register(29), -16)), (4, Offset(Register(30), -8)), (8, CfaRegister(Register(29)))] }");
     }
 
     fn create_function(call_conv: CallConv, stack_slot: Option<StackSlotData>) -> Function {
-        let mut func =
-            Function::with_name_signature(ExternalName::user(0, 0), Signature::new(call_conv));
+        let mut func = Function::with_name_signature(Default::default(), Signature::new(call_conv));
 
         let block0 = func.dfg.make_block();
         let mut pos = FuncCursor::new(&mut func);
@@ -117,7 +115,7 @@ mod tests {
         pos.ins().return_(&[]);
 
         if let Some(stack_slot) = stack_slot {
-            func.stack_slots.push(stack_slot);
+            func.sized_stack_slots.push(stack_slot);
         }
 
         func
@@ -146,14 +144,14 @@ mod tests {
 
         assert_eq!(
             format!("{:?}", fde),
-            "FrameDescriptionEntry { address: Constant(4321), length: 16, lsda: None, instructions: [(0, ValExpression(Register(34), Expression { operations: [Simple(DwOp(48))] }))] }"
+            "FrameDescriptionEntry { address: Constant(4321), length: 16, lsda: None, instructions: [] }"
         );
     }
 
     fn create_multi_return_function(call_conv: CallConv) -> Function {
         let mut sig = Signature::new(call_conv);
         sig.params.push(AbiParam::new(types::I32));
-        let mut func = Function::with_name_signature(ExternalName::user(0, 0), sig);
+        let mut func = Function::with_name_signature(Default::default(), sig);
 
         let block0 = func.dfg.make_block();
         let v0 = func.dfg.append_block_param(block0, types::I32);

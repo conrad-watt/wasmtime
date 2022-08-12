@@ -19,17 +19,20 @@
         clippy::use_self
     )
 )]
-#![cfg_attr(not(memory_init_cow), allow(unused_variables, unreachable_code))]
-
-use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
 
 use anyhow::Error;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use wasmtime_environ::DefinedFuncIndex;
 use wasmtime_environ::DefinedMemoryIndex;
 use wasmtime_environ::FunctionInfo;
 use wasmtime_environ::SignatureIndex;
 
+#[macro_use]
+mod trampolines;
+
+#[cfg(feature = "component-model")]
+pub mod component;
 mod export;
 mod externref;
 mod imports;
@@ -50,23 +53,27 @@ pub use crate::export::*;
 pub use crate::externref::*;
 pub use crate::imports::Imports;
 pub use crate::instance::{
-    InstanceAllocationRequest, InstanceAllocator, InstanceHandle, InstantiationError, LinkError,
-    OnDemandInstanceAllocator, StorePtr,
+    allocate_single_memory_instance, InstanceAllocationRequest, InstanceAllocator, InstanceHandle,
+    InstantiationError, LinkError, OnDemandInstanceAllocator, StorePtr,
 };
 #[cfg(feature = "pooling-allocator")]
 pub use crate::instance::{InstanceLimits, PoolingAllocationStrategy, PoolingInstanceAllocator};
-pub use crate::memory::{DefaultMemoryCreator, Memory, RuntimeLinearMemory, RuntimeMemoryCreator};
+pub use crate::memory::{
+    DefaultMemoryCreator, Memory, RuntimeLinearMemory, RuntimeMemoryCreator, SharedMemory,
+};
 pub use crate::mmap::Mmap;
 pub use crate::mmap_vec::MmapVec;
 pub use crate::table::{Table, TableElement};
+pub use crate::trampolines::prepare_host_to_wasm_trampoline;
 pub use crate::traphandlers::{
     catch_traps, init_traps, raise_lib_trap, raise_user_trap, resume_panic, tls_eager_initialize,
-    Backtrace, SignalHandler, TlsRestore, Trap,
+    Backtrace, SignalHandler, TlsRestore, Trap, TrapReason,
 };
 pub use crate::vmcontext::{
     VMCallerCheckedAnyfunc, VMContext, VMFunctionBody, VMFunctionImport, VMGlobalDefinition,
-    VMGlobalImport, VMInvokeArgument, VMMemoryDefinition, VMMemoryImport, VMRuntimeLimits,
-    VMSharedSignatureIndex, VMTableDefinition, VMTableImport, VMTrampoline, ValRaw,
+    VMGlobalImport, VMHostFuncContext, VMInvokeArgument, VMMemoryDefinition, VMMemoryImport,
+    VMOpaqueContext, VMRuntimeLimits, VMSharedSignatureIndex, VMTableDefinition, VMTableImport,
+    VMTrampoline, ValRaw,
 };
 
 mod module_id;
@@ -194,4 +201,36 @@ pub trait ModuleRuntimeInfo: Send + Sync + 'static {
     /// Returns an array, indexed by `SignatureIndex` of all
     /// `VMSharedSignatureIndex` entries corresponding to the `SignatureIndex`.
     fn signature_ids(&self) -> &[VMSharedSignatureIndex];
+}
+
+/// Returns the host OS page size, in bytes.
+pub fn page_size() -> usize {
+    static PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+    return match PAGE_SIZE.load(Ordering::Relaxed) {
+        0 => {
+            let size = get_page_size();
+            assert!(size != 0);
+            PAGE_SIZE.store(size, Ordering::Relaxed);
+            size
+        }
+        n => n,
+    };
+
+    #[cfg(windows)]
+    fn get_page_size() -> usize {
+        use std::mem::MaybeUninit;
+        use windows_sys::Win32::System::SystemInformation::*;
+
+        unsafe {
+            let mut info = MaybeUninit::uninit();
+            GetSystemInfo(info.as_mut_ptr());
+            info.assume_init_ref().dwPageSize as usize
+        }
+    }
+
+    #[cfg(unix)]
+    fn get_page_size() -> usize {
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    }
 }
