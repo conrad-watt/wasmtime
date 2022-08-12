@@ -145,7 +145,7 @@ pub fn differential_v8_execution(wasm: &[u8], config: &crate::generators::Config
             return Some(());
         }
     };
-
+/*
     // Verify V8 and wasmtime match memories
     if let Some(mem) = first_exported_memory(&wasmtime_module) {
         log::trace!("comparing memories");
@@ -170,7 +170,7 @@ pub fn differential_v8_execution(wasm: &[u8], config: &crate::generators::Config
                 panic!("memories differ");
             }
         }
-    }
+    } */
 
     Some(())
 }

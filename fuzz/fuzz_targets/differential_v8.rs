@@ -18,9 +18,9 @@ fn run(data: &[u8]) -> Result<()> {
 
     // Enable features that v8 has implemented
     config.module_config.config.simd_enabled = true;
-    config.module_config.config.bulk_memory_enabled = true;
-    config.module_config.config.reference_types_enabled = true;
-
+    // config.module_config.config.bulk_memory_enabled = true;
+    // config.module_config.config.reference_types_enabled = true;
+/*
     // Allow multiple tables, as set_differential_config() assumes reference
     // types are disabled and therefore sets max_tables to 1
     config.module_config.config.max_tables = 4;
@@ -31,7 +31,7 @@ fn run(data: &[u8]) -> Result<()> {
     {
         limits.tables = 4;
     }
-
+*/
     let module = config.generate(&mut u, Some(1000))?;
     oracles::differential_v8_execution(&module.to_bytes(), &config);
     Ok(())

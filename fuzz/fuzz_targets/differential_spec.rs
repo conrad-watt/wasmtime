@@ -26,22 +26,10 @@ fn run(data: &[u8]) -> Result<()> {
 
     // TODO: this is a best-effort attempt to avoid errors caused by the
     //       generated module exporting no functions.
-    config.module_config.config.min_exports = 5;
-    config.module_config.config.max_exports = 5;
+    // config.module_config.config.min_exports = 5;
+    // config.module_config.config.max_exports = 5;
 
     let module = config.generate(&mut u, Some(1000))?;
-    let tried = TRIED.fetch_add(1, SeqCst);
-    let executed = match oracles::differential_spec_execution(&module.to_bytes(), &config) {
-        Some(_) => EXECUTED.fetch_add(1, SeqCst),
-        None => EXECUTED.load(SeqCst),
-    };
-    if tried > 0 && tried % 1000 == 0 {
-        println!(
-            "=== Execution rate ({} executed modules / {} tried modules): {}% ===",
-            executed,
-            tried,
-            executed as f64 / tried as f64 * 100f64
-        )
-    }
+    oracles::differential_spec_execution(&module.to_bytes(), &config);
     Ok(())
 }

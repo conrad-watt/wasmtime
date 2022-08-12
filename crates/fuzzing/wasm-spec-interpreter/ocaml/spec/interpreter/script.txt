@@ -1,0 +1,7 @@
+expr="(assert_return (invoke \"\""
+for i in `seq 0 19`; do
+  expr="$expr (f32.const 0)"
+done
+expr="$expr) (f32.const 0))"
+time ./wasm -i testcase0.wasm -e "$expr"
+time ./wasm -isa -i testcase0.wasm -e "$expr"

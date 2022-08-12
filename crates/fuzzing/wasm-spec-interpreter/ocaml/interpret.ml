@@ -18,7 +18,7 @@ type ffi_value =
   | F64 of int64
   | V128 of Bytes.t
 
-(** Helper for converting the FFI values to their spec interpreter type. *)
+(** (Isabelle) Helper for converting the FFI values to their spec interpreter type. *)
 let convert_to_wasm (v: ffi_value) : v = match v with
 | I32 n -> V_num (ConstInt32 (I32_impl_abs n))
 | I64 n -> V_num (ConstInt64 (I64_impl_abs n))
@@ -26,13 +26,31 @@ let convert_to_wasm (v: ffi_value) : v = match v with
 | F64 n -> V_num (ConstFloat64 (F64.of_bits n))
 | V128 n -> V_vec (ConstVec128 (V128.of_bits (Bytes.to_string n)))
 
-(** Helper for converting the spec interpreter values to their FFI type. *)
+(** (Isabelle) Helper for converting the spec interpreter values to their FFI type. *)
 let convert_from_wasm (v: v) : ffi_value = match v with
 | V_num ((ConstInt32 (I32_impl_abs n))) -> I32 n
 | V_num ((ConstInt64 (I64_impl_abs n))) -> I64 n
 | V_num ((ConstFloat32 n)) -> F32 (F32.to_bits n)
 | V_num ((ConstFloat64 n)) -> F64 (F64.to_bits n)
 | V_vec ((ConstVec128 n)) -> V128 (Bytes.of_string (V128.to_bits n))
+| _ -> failwith "Unknown type"
+
+
+(** Helper for converting the FFI values to their spec interpreter type. *)
+let convert_to_wasm_spec (v: ffi_value) : Values.value = match v with
+| I32 n -> Values.Num (I32 n)
+| I64 n -> Values.Num (I64 n)
+| F32 n -> Values.Num (F32 (F32.of_bits n))
+| F64 n -> Values.Num (F64 (F64.of_bits n))
+| V128 n -> Values.Vec (V128 (V128.of_bits (Bytes.to_string n)))
+
+(** Helper for converting the spec interpreter values to their FFI type. *)
+let convert_from_wasm_spec (v: Values.value) : ffi_value = match v with
+| Values.Num (I32 n) -> I32 n
+| Values.Num (I64 n) -> I64 n
+| Values.Num (F32 n) -> F32 (F32.to_bits n)
+| Values.Num (F64 n) -> F64 (F64.to_bits n)
+| Values.Vec (V128 n) -> V128 (Bytes.of_string (V128.to_bits n))
 | _ -> failwith "Unknown type"
 
 (** Parse the given WebAssembly module binary into an Ast.module_. At some point in the future this
@@ -42,17 +60,27 @@ let parse bytes =
   let bytes_as_str = Bytes.to_string bytes in
   (Decode.decode "default" bytes_as_str)
 
-(** Return true if an export is a function. *)
+(** (Isabelle) Return true if an export is a function. *)
 let match_exported_func export = match export with
 | Module_export_ext(_,Ext_func n,_) -> true
 | _ -> false
 
-(** Extract a function from its export or fail. *)
+(** (Isabelle) Extract a function from its export or fail. *)
 let extract_exported_func export = match export with
 | Module_export_ext(_,Ext_func n,_) -> n
 | _ -> failwith ""
 
-(** Interpret the first exported function and return the result. Use provided
+(** Return true if an export is a function. *)
+let match_exported_func_spec export = match export with
+| (_, Instance.ExternFunc(func)) -> true
+| _ -> false
+
+(** Extract a function from its export or fail. *)
+let extract_exported_func_spec export = match export with
+| (_, Instance.ExternFunc(func)) -> func
+| _ -> failwith ""
+
+(** (Isabelle) Interpret the first exported function and return the result. Use provided
 parameters if they exist, otherwise use default (zeroed) values. *)
 let interpret_exn module_bytes opt_params =
   let opt_params_ = Option.map (List.map convert_to_wasm) opt_params in
@@ -68,6 +96,22 @@ let interpret_exn module_bytes opt_params =
   | (s', (RCrash (Error_invariant str))) -> raise (Eval.Crash (Source.no_region, "(Isabelle) error: " ^ str))
   (* TODO eventually we should hash the memory state and return the hash *)
   )
+
+let get_defaults f =
+  match f with
+  Func.AstFunc(Types.FuncType(ints,outts),_,_) -> (List.map Values.default_value ints)
+
+(** Interpret the first exported function with the given parameters and return the result. *)
+let interpret_exn_spec module_bytes opt_params =
+  let module_ = parse module_bytes in
+  let instance = Eval.init module_ [] in
+  let func = extract_exported_func_spec (List.find match_exported_func_spec instance.exports) in
+  let (params' : Wasm.Values.value list) =
+    (match opt_params with | None -> (get_defaults func) | Some params -> List.map convert_to_wasm_spec params) in
+  let returns = Eval.invoke func params' in
+  let returns' = List.map convert_from_wasm_spec returns in
+  returns' (* TODO eventually we should hash the memory state and return the hash *)
+
 
 let interpret module_bytes opt_params =
   try Ok(interpret_exn module_bytes opt_params) with
