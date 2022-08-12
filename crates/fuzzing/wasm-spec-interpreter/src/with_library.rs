@@ -45,7 +45,8 @@ pub fn interpret(module: &[u8], opt_parameters: Option<Vec<Value>>) -> Result<Ve
 mod ocaml_bindings {
     use super::*;
     use ocaml_interop::{
-        impl_conv_ocaml_variant, ocaml, OCamlBytes, OCamlInt32, OCamlInt64, OCamlList,
+        impl_conv_ocaml_variant, ocaml, FromOCaml, OCaml, OCamlBytes, OCamlInt32, OCamlInt64,
+        OCamlList,
     };
 
     // Using this macro converts the enum both ways: Rust to OCaml and OCaml to
@@ -61,13 +62,47 @@ mod ocaml_bindings {
         }
     }
 
+    /// Represents a WebAssembly instance from the OCaml interpreter side.
+    pub struct OCamlInstance {
+        raw: isize,
+    }
+    unsafe impl FromOCaml<OCamlInstance> for OCamlInstance {
+        fn from_ocaml(v: OCaml<OCamlInstance>) -> Self {
+            Self {
+                raw: unsafe { v.raw() },
+            }
+        }
+    }
+    unsafe impl ToOCaml<OCamlInstance> for OCamlInstance {
+        fn to_ocaml<'a>(&self, cr: &'a mut OCamlRuntime) -> OCaml<'a, OCamlInstance> {
+            // TODO need to convert whatever `isize` we have...
+            unsafe { OCaml::new(cr, self.raw) }
+        }
+    }
+
+    /// Represents a WebAssembly export from the OCaml interpreter side.
+    #[allow(dead_code)]
+    pub enum OCamlExport {
+        Global(Value),
+        Memory(Vec<u8>),
+    }
+    // Using this macro converts the enum both ways.
+    impl_conv_ocaml_variant! {
+        OCamlExport {
+            OCamlExport::Global(i: Value),
+            OCamlExport::Memory(i: OCamlBytes),
+        }
+    }
+
     // These functions must be exposed from OCaml with:
     //   `Callback.register "interpret" interpret`
     //
     // In Rust, this function becomes:
     //   `pub fn interpret(_: &mut OCamlRuntime, ...: OCamlRef<...>) -> BoxRoot<...>;`
     ocaml! {
+        pub fn instantiate(module: OCamlBytes) -> Result<OCamlInstance, String>;
         pub fn interpret(module: OCamlBytes, params: Option<OCamlList<Value>>) -> Result<OCamlList<Value>, String>;
+        pub fn export(instance: OCamlInstance, name: String) -> Result<OCamlExport, String>;
     }
 }
 
@@ -129,5 +164,47 @@ mod tests {
         let results = interpret(&module, parameters.clone()).unwrap();
 
         assert_eq!(results, vec![Value::I32(1795123818)]);
+    }
+
+    #[test]
+    fn result_roundtrip() {
+        // This test just checks that we can indeed convert back and forth from
+        // `Result<...>` types.
+        use ocaml_interop::*;
+        let mut or = OCamlRuntime::init();
+        let x0: Result<&[u8], String> = Ok(b".....");
+        // We can box the value in the OCaml runtime, resulting in a copy of the
+        // bytes--see `alloc_bytes` in `impl ToOCaml<OCamlBytes> for &[u8]`
+        // (`to_ocaml.rs`).
+        let x1: BoxRoot<Result<OCamlBytes, String>> = x0.to_boxroot(&mut or);
+        // Then we can return the value to Rust with another copy--see
+        // `extend_from_slice` in `impl FromOCaml<OCamlBytes> for Vec<u8>`
+        // (`from_ocaml.rs`).
+        let _x2: Result<Vec<u8>, String> = x1.to_rust(&mut or);
+    }
+
+    #[test]
+    fn instantiate() {
+        use ocaml_bindings::*;
+        use ocaml_interop::*;
+        let module = wat::parse_file("tests/shr_s.wat").unwrap();
+        let mut ocaml_runtime = OCamlRuntime::init();
+
+        // Instantiate the module to a Rust `OCamlInstance`.
+        let module = module.to_boxroot(&mut ocaml_runtime);
+        let instance: BoxRoot<Result<OCamlInstance, String>> =
+            instantiate(&mut ocaml_runtime, &module);
+        let instance: Result<OCamlInstance, String> = instance.to_rust(&mut ocaml_runtime);
+        let instance: OCamlInstance = instance.unwrap();
+
+        // Retrieve an export from the `OCamlInstance`.
+        let instance: BoxRoot<OCamlInstance> = instance.to_boxroot(&mut ocaml_runtime);
+        let export_name: String = "foo".into();
+        let export_name: BoxRoot<String> = export_name.to_boxroot(&mut ocaml_runtime);
+        let export: BoxRoot<Result<OCamlExport, String>> =
+            export(&mut ocaml_runtime, &instance, &export_name);
+        let export: Result<OCamlExport, String> = export.to_rust(&mut ocaml_runtime);
+        assert!(export.is_err());
+        // etc.
     }
 }
