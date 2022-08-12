@@ -9,6 +9,14 @@
 use crate::Value;
 
 #[allow(dead_code)]
+pub fn ensure_init() {
+    panic!(
+        "wasm-spec-interpreter was built without its Rust-to-OCaml shim \
+        library; re-compile with the dependencies listed in its README.md."
+    );
+}
+
+#[allow(dead_code)]
 pub fn interpret(_module: &[u8], _parameters: Option<Vec<Value>>) -> Result<Vec<Value>, String> {
     panic!(
         "wasm-spec-interpreter was built without its Rust-to-OCaml shim \

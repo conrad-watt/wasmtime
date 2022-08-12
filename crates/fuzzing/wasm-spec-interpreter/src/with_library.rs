@@ -15,6 +15,11 @@ lazy_static! {
     static ref INTERPRET: Mutex<()> = Mutex::new(());
 }
 
+// TODO: comment
+pub fn ensure_init() {
+    OCamlRuntime::init_persistent();
+}
+
 /// Interpret the first function in the passed WebAssembly module (in Wasm form,
 /// currently, not WAT), optionally with the given parameters. If no parameters
 /// are provided, the function is invoked with zeroed parameters.

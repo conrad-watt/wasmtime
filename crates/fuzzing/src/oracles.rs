@@ -795,20 +795,9 @@ pub fn differential_spec_execution(wasm: &[u8], config: &generators::Config) -> 
     use anyhow::Context;
 
     crate::init_fuzzing();
+    wasm_spec_interpreter::ensure_init();
     debug!("config: {:#?}", config);
     log_wasm(wasm);
-
-    // Run the spec interpreter first, then Wasmtime. The order is important
-    // because both sides (OCaml runtime and Wasmtime) register signal handlers;
-    // Wasmtime uses these signal handlers for catching various WebAssembly
-    // failures. On certain OSes (e.g. Linux x86_64), the signal handlers
-    // interfere, observable as an uncaught `SIGSEGV`--not even caught by
-    // libFuzzer. By running Wasmtime second, its signal handlers are registered
-    // most recently and they catch failures appropriately.
-    //
-    // For now, execute with dummy (zeroed) function arguments.
-    let spec_vals = wasm_spec_interpreter::interpret(wasm, None);
-    debug!("spec interpreter returned: {:?}", &spec_vals);
 
     let (wasmtime_module, mut wasmtime_store) = differential_store(wasm, config);
     let wasmtime_module = match wasmtime_module {
@@ -833,6 +822,18 @@ pub fn differential_spec_execution(wasm: &[u8], config: &generators::Config) -> 
                 .call(&mut wasmtime_store, &dummy_params, &mut results)
                 .map(|()| Some(results))
         });
+
+    // Run the spec interpreter first, then Wasmtime. The order is important
+    // because both sides (OCaml runtime and Wasmtime) register signal handlers;
+    // Wasmtime uses these signal handlers for catching various WebAssembly
+    // failures. On certain OSes (e.g. Linux x86_64), the signal handlers
+    // interfere, observable as an uncaught `SIGSEGV`--not even caught by
+    // libFuzzer. By running Wasmtime second, its signal handlers are registered
+    // most recently and they catch failures appropriately.
+    //
+    // For now, execute with dummy (zeroed) function arguments.
+    let spec_vals = wasm_spec_interpreter::interpret(wasm, None);
+    debug!("spec interpreter returned: {:?}", &spec_vals);
 
     // Match a spec interpreter value against a Wasmtime value. Eventually this
     // should support references and `v128` (TODO).
