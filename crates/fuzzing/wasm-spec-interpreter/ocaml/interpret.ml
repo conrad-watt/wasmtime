@@ -16,19 +16,17 @@ type ffi_value =
   | F64 of int64
   | V128 of Bytes.t
 
-(** An opaque reference to the instance used by the interpreter. This is
-currently using a garbage type (TODO). *)
-type ffi_instance = int
-
-(** Enumerate the kinds of things the interpreter can export. *)
-type ffi_export =
-  | Memory of Bytes.t
+(** Enumerate the kinds of exported values the interpreter can retrieve. *)
+type ffi_export_value =
   | Global of ffi_value
+  | Memory of Bytes.t
 
 (* Here we access the WebAssembly specification interpreter; this must be linked
 in. *)
 open Wasm
 open Wasm.WasmRef_Isa_m.WasmRef_Isa
+
+let global_store : (unit s_m_ext) ref = ref (make_empty_store_m ());;
 
 (** Helper for converting the FFI values to their spec interpreter type. *)
 let convert_to_wasm (v: ffi_value) : v = match v with
@@ -53,16 +51,40 @@ let parse bytes =
   let bytes_as_str = Bytes.to_string bytes in
   (Decode.decode "default" bytes_as_str)
 
-(** Construct an instance from a sequence of WebAssembly bytes. *)
-let instantiate module_bytes = Ok(42)
+(** Construct an instance from a sequence of WebAssembly bytes. This clears the
+previous contents of the global store *)
+let instantiate_exn module_bytes =
+  let s = (make_empty_store_m ()) in
+  let module_ = parse module_bytes in
+  let m_isa = Ast_convert.convert_module (module_.it) in
+  global_store := s;
+  (match interp_instantiate_init_m s m_isa [] () with
+  | (s', (RI_res_m(inst,v_exps,_))) -> global_store := s'; v_exps
+  | (s', (RI_trap_m str)) -> global_store := s'; raise (Eval.Trap (Source.no_region, "(Isabelle) trap: " ^ str))
+  | (s', (RI_crash_m (Error_exhaustion str))) -> global_store := s'; raise (Eval.Exhaustion (Source.no_region, "(Isabelle) call stack exhausted"))
+  | (s', (RI_crash_m (Error_invalid str))) -> global_store := s'; raise (Eval.Crash (Source.no_region, "(Isabelle) error: " ^ str))
+  | (s', (RI_crash_m (Error_invariant str))) -> global_store := s'; raise (Eval.Crash (Source.no_region, "(Isabelle) error: " ^ str))
+  )
 
-(** Retrieve an export by name from a WebAssembly instance. *)
-let export instance name =
-  print_endline "here"; Error("no export found")
+let instantiate module_bytes =
+  try Ok(instantiate_exn module_bytes) with
+  | _ as e -> Error(Printexc.to_string e)
+
+(** Retrieve the value of an export by name from a WebAssembly instance. *)
+let export_exn (inst : unit module_export_ext list) (name : string) : ffi_export_value =
+  match (e_desc (List.find (fun exp -> String.equal (e_name exp) name) inst)) with
+    Ext_func _ -> raise Not_found
+  | Ext_tab _ -> raise Not_found
+  | Ext_mem i -> Memory (fst (Array.get (mems (!global_store)) (Z.to_int (integer_of_nat i))))
+  | Ext_glob i -> Global (convert_from_wasm (g_val (Array.get (globs (!global_store)) (Z.to_int (integer_of_nat i)))))
+
+let export inst name =
+  try Ok(export_exn inst name) with
+  | _ as e -> Error(Printexc.to_string e)
 
 (** Interpret the first exported function and return the result. Use provided
 parameters if they exist, otherwise use default (zeroed) values. *)
-let interpret_exn module_bytes opt_params =
+let interpret_legacy_exn module_bytes opt_params =
   let opt_params_ = Option.map (List.rev_map convert_to_wasm) opt_params in
   let module_ = parse module_bytes in
   let m_isa = Ast_convert.convert_module (module_.it) in
@@ -76,11 +98,42 @@ let interpret_exn module_bytes opt_params =
   | (s', (RCrash (Error_invariant str))) -> raise (Eval.Crash (Source.no_region, "(Isabelle) error: " ^ str))
   )
 
-let interpret module_bytes opt_params =
-  try Ok(interpret_exn module_bytes opt_params) with
+let interpret_legacy module_bytes opt_params =
+  try Ok(interpret_legacy_exn module_bytes opt_params) with
+  | _ as e -> Error(Printexc.to_string e)
+
+(* process an optional list of params, generating default params if necessary *)
+(* TODO: this should be done in the Isabelle model *)
+let get_param_vs (vs_opt :(ffi_value list) option) i =
+  (match vs_opt with
+   | None -> (match cl_m_type ((array_nth heap_cl_m (funcs !global_store) i) ()) with Tf (t1, _) -> map bitzero t1)
+   | Some vs -> List.map convert_to_wasm vs)
+
+(** Interpret the function exported at name. Use provided
+parameters if they exist, otherwise use default (zeroed) values. *)
+let interpret_exn (inst : unit module_export_ext list) (name : string) opt_params =
+  (let fuel = Z.of_string "4611686018427387904" in
+   let max_call_depth = Z.of_string "300" in
+   match (e_desc (List.find (fun exp -> String.equal (e_name exp) name) inst)) with
+   | Ext_func i ->
+       (let params = get_param_vs opt_params i in
+        let (s', res) = run_invoke_v_m (nat_of_integer fuel) (nat_of_integer max_call_depth) ((!global_store), (params, i)) () in
+        global_store := s';
+        (match res with 
+         | RValue vs_isa' -> List.rev_map convert_from_wasm vs_isa'
+         | RTrap str -> raise (Eval.Trap (Source.no_region, "(Isabelle) trap: " ^ str))
+         | (RCrash (Error_exhaustion str)) -> raise (Eval.Exhaustion (Source.no_region, "(Isabelle) call stack exhausted"))
+         | (RCrash (Error_invalid str)) -> raise (Eval.Crash (Source.no_region, "(Isabelle) error: " ^ str))
+         | (RCrash (Error_invariant str)) -> raise (Eval.Crash (Source.no_region, "(Isabelle) error: " ^ str)) 
+        ))
+   | _ -> raise Not_found)
+
+let interpret inst name opt_params =
+  try Ok(interpret_exn inst name opt_params) with
   | _ as e -> Error(Printexc.to_string e)
 
 let () =
   Callback.register "instantiate" instantiate;
+  Callback.register "interpret_legacy" interpret_legacy;
   Callback.register "interpret" interpret;
   Callback.register "export" export;
